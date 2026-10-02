@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "DngConverterEx"
+version = "1.1.0"
+description = "Desktop Adobe DNG Converter front end with JPEG XL quality and MP resize controls"
+requires-python = ">=3.10"
+dependencies = []
+readme = "README.md"
+license = {file = "LICENSE.txt"}
+keywords = ["raw", "dng", "jpeg-xl", "photography", "tkinter"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
+
+[project.urls]
+Repository = "https://github.com/torowasa-dev/dng_converter_ex"
+Issues = "https://github.com/torowasa-dev/dng_converter_ex/issues"
+
+[project.scripts]
+dngconverterex = "raw_to_dng.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["raw_to_dng*"]

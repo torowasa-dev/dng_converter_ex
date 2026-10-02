@@ -1,0 +1,75 @@
+{
+  "created_utc": "2026-10-01T16:07:27.879807+00:00",
+  "app_version": "1.1.0",
+  "automated_tests": {
+    "passed": 17,
+    "failed": 0,
+    "command": "python -m unittest discover -s tests -v"
+  },
+  "gui": {
+    "environment": "Linux / Xvfb / Python 3.12 / Tcl-Tk 8.6 / Noto Sans CJK JP",
+    "pages_checked": 6,
+    "checks": [
+      "F1",
+      "all pages",
+      "wheel scrolling",
+      "window reuse",
+      "reopen",
+      "Escape",
+      "help entry",
+      "available while busy",
+      "conversion settings unchanged",
+      "no preferences written",
+      "progress bar visible"
+    ],
+    "actual_screenshots": [
+      {
+        "path": "docs/screenshots/advanced.png",
+        "dimensions": [
+          1280,
+          960
+        ]
+      },
+      {
+        "path": "docs/screenshots/main.png",
+        "dimensions": [
+          1280,
+          960
+        ]
+      },
+      {
+        "path": "docs/screenshots/parameters.png",
+        "dimensions": [
+          1120,
+          980
+        ]
+      },
+      {
+        "path": "docs/screenshots/quality-guide.png",
+        "dimensions": [
+          1120,
+          980
+        ]
+      }
+    ],
+    "visual_review": "Japanese glyphs and visible controls checked on captured main, advanced and guide screens."
+  },
+  "documentation": {
+    "relative_links": "pass",
+    "offline_guide_consistency": "pass",
+    "python_310_syntax": "pass",
+    "version_consistency": "pass"
+  },
+  "tested": "Metadata fixtures and simulated converter; process, file protection, timeout, cancellation, MP argument and structural checks; real Tkinter display and quality-guide interaction on Linux.",
+  "not_tested": [
+    "Actual Adobe DNG Converter",
+    "Real manufacturer RAW conversion",
+    "Windows/macOS GUI execution",
+    "Lightroom import and Kelvin WB operation",
+    "Decoded image quality",
+    "Windows EXE build",
+    "GitHub Actions execution"
+  ],
+  "fixture_notice": "Synthetic compressed payloads are not real image codestreams and must not be used as imaging compatibility evidence.",
+  "project_name": "DngConverterEx"
+}
