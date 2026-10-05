@@ -1,14 +1,16 @@
 {
-  "created_utc": "2026-10-01T16:07:27.879807+00:00",
-  "app_version": "1.1.0",
+  "created_utc": "2026-10-05T03:11:05.318305+00:00",
+  "project_name": "DngConverterEx",
+  "app_version": "1.2.0",
   "automated_tests": {
-    "passed": 17,
+    "passed": 32,
     "failed": 0,
-    "command": "python -m unittest discover -s tests -v"
+    "command": "python3 -m unittest discover -s tests -v",
+    "python": "3.12.14"
   },
   "gui": {
-    "environment": "Linux / Xvfb / Python 3.12 / Tcl-Tk 8.6 / Noto Sans CJK JP",
-    "pages_checked": 6,
+    "environment": "Linux / Xvfb / Python 3.12.3 / Tcl-Tk 8.6 / Noto Sans CJK JP",
+    "pages_checked": 7,
     "checks": [
       "F1",
       "all pages",
@@ -19,7 +21,14 @@
       "help entry",
       "available while busy",
       "conversion settings unchanged",
-      "no preferences written",
+      "no user preferences changed",
+      "effort 7 preset",
+      "fallback disabled and cleared for resize",
+      "lossless JXL effort disabled",
+      "preferences save and restore",
+      "controls disabled while busy",
+      "retry progress",
+      "retry completion",
       "progress bar visible"
     ],
     "actual_screenshots": [
@@ -50,9 +59,16 @@
           1120,
           980
         ]
+      },
+      {
+        "path": "docs/screenshots/recovery-guide.png",
+        "dimensions": [
+          1120,
+          980
+        ]
       }
     ],
-    "visual_review": "Japanese glyphs and visible controls checked on captured main, advanced and guide screens."
+    "visual_review": "Japanese text and visible controls reviewed on all five captured screens."
   },
   "documentation": {
     "relative_links": "pass",
@@ -60,16 +76,16 @@
     "python_310_syntax": "pass",
     "version_consistency": "pass"
   },
-  "tested": "Metadata fixtures and simulated converter; process, file protection, timeout, cancellation, MP argument and structural checks; real Tkinter display and quality-guide interaction on Linux.",
+  "tested": "Synthetic DNG metadata and real simulated processes: targeted assertion retry, fresh staging, opt-in fallback, unchanged quality/resolution, shared timeout, cancellation, source protection, per-attempt settings/logs, CLI options; actual Tkinter controls, saved preferences, guide navigation and retry progress on Linux.",
   "not_tested": [
     "Actual Adobe DNG Converter",
+    "Workaround on the reported RAW file",
     "Real manufacturer RAW conversion",
     "Windows/macOS GUI execution",
     "Lightroom import and Kelvin WB operation",
     "Decoded image quality",
-    "Windows EXE build",
-    "GitHub Actions execution"
+    "Windows EXE build"
   ],
-  "fixture_notice": "Synthetic compressed payloads are not real image codestreams and must not be used as imaging compatibility evidence.",
-  "project_name": "DngConverterEx"
+  "github_actions": "Runs on push; repository Actions records the result for each commit.",
+  "fixture_notice": "Synthetic compressed payloads are not real image codestreams and must not be used as imaging compatibility evidence."
 }

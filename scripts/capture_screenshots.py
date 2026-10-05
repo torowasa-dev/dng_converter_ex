@@ -17,6 +17,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from raw_to_dng import __version__
+from raw_to_dng.core import MODE_LABELS, Mode
 from raw_to_dng.gui import Application
 from raw_to_dng.help_content import HELP_PAGES
 
@@ -61,7 +62,7 @@ def main() -> int:
                 app._add_paths(["/写真/RAW"])
                 app.resize.set("画素数で指定（MP）")
                 app._resize_changed()
-                app.effort.set("9")
+                app.effort.set("7")
                 app.preview.set("なし")
                 app.fast_load.set(False)
                 app.status.set("画面例：サンプルの入力パスを表示。変換は実行していません。")
@@ -70,7 +71,45 @@ def main() -> int:
                 capture(root, screenshots / "main.png")
                 app.notebook.select(1)
                 capture(root, screenshots / "advanced.png")
+                assert 'disabled' in app.jxl_fallback_widget.state(), 'Resized outputs must disable fallback'
+                app.resize.set('原寸を維持')
+                app._settings_changed()
+                app.jxl_fallback.set(True)
+                app.effort.set('9')
+                app.effort_7_button.invoke()
+                assert app.effort.get() == '7' and app.jxl_retry.get(), 'Compatibility preset failed'
+                assert app.distance.get() == '0.1' and app.resize.get() == '原寸を維持'
+                app._save_settings()
+                saved = json.loads(settings_file.read_text(encoding='utf-8'))
+                assert saved['jxl_retry'] and saved['jxl_fallback'], 'Recovery preferences were not saved'
+                app.jxl_retry.set(False)
+                app.jxl_fallback.set(False)
+                app._load_settings()
+                assert app.jxl_retry.get() and app.jxl_fallback.get(), 'Recovery preferences were not restored'
+                settings_file.unlink()
+                app.mode.set(MODE_LABELS[Mode.LOSSLESS_JXL])
+                app._settings_changed()
+                assert 'disabled' in app.effort_widget.state(), 'Ignored effort should be disabled'
+                assert 'disabled' not in app.jxl_fallback_widget.state(), 'Lossless JXL fallback should be selectable'
+                app.mode.set(MODE_LABELS[Mode.LOSSY_JXL])
+                app.resize.set('画素数で指定（MP）')
+                app._settings_changed()
+                assert not app.jxl_fallback.get(), 'Resize must clear fallback'
+                app._set_busy(True)
+                assert 'disabled' in app.jxl_retry_widget.state(), 'Recovery controls changed while busy'
+                app._set_busy(False)
+                assert app._collect_settings() == before, 'GUI recovery checks changed conversion settings'
                 app.notebook.select(0)
+
+                app.result_tree.insert('', 'end', iid='0', values=('sample.NEF', '変換中', '', '', '', ''))
+                app.events.put(('retry', {'index': 0, 'source': 'sample.NEF', 'message': 'effort 9→7で再試行'}))
+                app._poll()
+                assert app.result_tree.set('0', 'state') == '再試行中', 'Retry progress was not shown'
+                app.events.put(('result', {'index': 0, 'source': 'sample.NEF', 'status': 'ok',
+                                          'message': 'effort 9→7で再試行成功', 'attempts': [{}, {}]}))
+                app._poll()
+                assert app.result_tree.set('0', 'state') == '完了（再試行）', 'Retry completion was not shown'
+                app.result_tree.delete('0')
 
                 root.focus_force()
                 refresh(root)
@@ -101,6 +140,8 @@ def main() -> int:
                 guide.window.geometry("1120x980+0+0")
                 guide.select("parameters")
                 capture(guide.window, screenshots / "parameters.png")
+                guide.select("recovery")
+                capture(guide.window, screenshots / "recovery-guide.png")
                 assert app._collect_settings() == before, "Guide changed conversion settings"
 
                 app._show_guide("adobe")
@@ -123,14 +164,16 @@ def main() -> int:
                 app._set_busy(False)
                 assert not errors, errors
                 assert app.progress.winfo_ismapped(), "Progress bar is not visible"
-                assert not settings_file.exists(), "Capture wrote application preferences"
+                assert not settings_file.exists(), "Capture left application preferences"
                 print(json.dumps({
                     "app_version": __version__,
                     "font": app.font_family,
                     "guide_pages_checked": len(HELP_PAGES),
                     "screenshots": [str(path.relative_to(ROOT)) for path in sorted(screenshots.glob("*.png"))],
                     "checks": ["F1", "all pages", "wheel scrolling", "window reuse", "reopen", "Escape",
-                               "help entry", "available while busy", "conversion settings unchanged", "no preferences written"],
+                               "help entry", "available while busy", "conversion settings unchanged", "no user preferences changed"],
+                    "recovery_checks": ["effort 7 preset", "fallback disabled and cleared for resize", "lossless JXL effort disabled",
+                                        "preferences save and restore", "controls disabled while busy", "retry progress", "retry completion"],
                     "adobe_conversion_run": False,
                 }, ensure_ascii=False, indent=2))
             finally:

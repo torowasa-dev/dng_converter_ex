@@ -6,13 +6,14 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from raw_to_dng.cli import main
-from raw_to_dng.core import Converter, Mode, Settings, Source, plan_jobs, publish, run_batch, scan_inputs
+from raw_to_dng.core import Converter, Mode, Settings, Source, is_jxl_histogram_assert, plan_jobs, publish, run_batch, scan_inputs
 from raw_to_dng.dng import DngError, inspect_dng
 from tests.fixtures import make_dng
 
@@ -37,6 +38,23 @@ class SettingsTests(unittest.TestCase):
             with self.subTest(settings=settings):
                 with self.assertRaises(ValueError):
                     settings.validate()
+
+    def test_fallback_cannot_discard_a_resolution_request(self):
+        for settings in (Settings(megapixels=24, jxl_fallback=True),
+                         Settings(long_edge=6000, jxl_fallback=True)):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                settings.validate()
+
+    def test_histogram_match_excludes_other_assertions(self):
+        self.assertTrue(is_jxl_histogram_assert(r'..\..\libjxl\lib\jxl\enc_ans.cc:222: JXL_DASSERT: n <= 255'))
+        self.assertTrue(is_jxl_histogram_assert('enc_ans.cc:228: JXL_DASSERT: n\t<=  255'))
+        for output in ('GPU disabled', 'other.cc:222: JXL_DASSERT: n <= 255',
+                       'enc_ans.cc:222: JXL_DASSERT: n <= 256',
+                       'enc_ans.cc:222: JXL_DASSERT: n <= 2550',
+                       'enc_ans.cc:222: JXL_DASSERT: other_n <= 255',
+                       'enc_ans.cc:222: other error\nelsewhere: JXL_DASSERT: n <= 255'):
+            with self.subTest(output=output):
+                self.assertFalse(is_jxl_histogram_assert(output))
 
 
 class InspectionTests(unittest.TestCase):
@@ -138,13 +156,43 @@ class PipelineTests(unittest.TestCase):
         self.output = self.base / "出力"
         self.engine = self.base / "Adobe 模擬 engine"
         project = Path(__file__).resolve().parent.parent
-        code = '''import math, sys, time
+        code = '''import json, math, os, sys, time
 from pathlib import Path
 sys.path.insert(0, PROJECT)
 from tests.fixtures import make_dng
 args = sys.argv[1:]
 source = Path(args[-1])
 dest = Path(args[args.index('-d')+1]) / args[args.index('-o')+1]
+with source.with_suffix('.attempts.jsonl').open('a', encoding='utf-8') as history:
+    history.write(json.dumps({'args': args, 'stage': str(dest), 'pid': os.getpid()}) + chr(10))
+effort = int(args[args.index('-jxl_effort')+1]) if '-jxl_effort' in args else None
+jxl = '-jxl' in args or '-losslessJXL' in args
+assertion = 'enc_ans.cc:222: JXL_DASSERT: n <= 255'
+if source.stem.startswith('gpuerror'):
+    print('GPU disabled', file=sys.stderr)
+    sys.exit(7)
+if source.stem.startswith('otherassert'):
+    print(assertion.replace('255', '256'), file=sys.stderr)
+    sys.exit(7)
+if source.stem.startswith('warningassert'):
+    print(assertion, file=sys.stderr)
+if jxl and source.stem.startswith('retryhang') and effort == 7:
+    time.sleep(8)
+if jxl and source.stem.startswith('slowassert'):
+    time.sleep(0.3)
+should_assert = jxl and (source.stem.startswith(('alwaysassert', 'slowassert')) or
+    source.stem.startswith(('highassert', 'retryhang', 'mutatingassert', 'missingafterassert', 'unrelatedafterassert')) and effort is not None and effort > 7)
+if should_assert:
+    dest.write_bytes(b'partial output from failed Adobe run')
+    if source.stem.startswith('mutatingassert'):
+        source.write_bytes(b'input changed during conversion')
+    print(assertion, file=sys.stderr)
+    sys.exit(7)
+if source.stem.startswith('missingafterassert'):
+    sys.exit(0)
+if source.stem.startswith('unrelatedafterassert'):
+    print('simulated unsupported RAW', file=sys.stderr)
+    sys.exit(7)
 if source.stem.startswith('hang'):
     time.sleep(8)
 if source.stem.startswith('fail'):
@@ -185,6 +233,165 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
             path.write_bytes(b"raw source unchanged")
             sources.append(Source(path))
         return plan_jobs(sources, self.output, settings or Settings())
+
+    def history(self, job):
+        return [json.loads(line) for line in job.source.path.with_suffix('.attempts.jsonl').read_text(encoding='utf-8').splitlines()]
+
+    def test_assert_retry_preserves_distance_resolution_and_metadata(self):
+        for resolution in ({'megapixels': 24}, {'long_edge': 5000}):
+            with self.subTest(resolution=resolution):
+                settings = Settings(distance=0.2, effort=9, embed_original=True, **resolution)
+                job = self.jobs(['highassert' + next(iter(resolution)) + '.NEF'], settings)[0]
+                source = job.source.path.read_bytes()
+                result = self.converter.convert(job)
+                self.assertEqual(result.status, 'ok', result.message)
+                self.assertEqual([a.settings['effort'] for a in result.attempts], [9, 7])
+                self.assertEqual([a.exit_code for a in result.attempts], [7, 0])
+                self.assertEqual(result.requested_settings['effort'], 9)
+                self.assertEqual(result.effective_settings['effort'], 7)
+                self.assertIn('effort 9→7', result.message)
+                self.assertIn('JXL_DASSERT', result.attempts[0].log)
+                history = self.history(job)
+                self.assertEqual(len({h['stage'] for h in history}), 2)
+                self.assertEqual(len({h['pid'] for h in history}), 2)
+                for h in history:
+                    args = h['args']
+                    self.assertEqual(args[args.index('-jxl_distance') + 1], '0.2')
+                    self.assertIn('-e', args)
+                    self.assertEqual(Path(args[-1]), job.source.path)
+                self.assertTrue(result.dng['wb_metadata_ready'])
+                self.assertTrue(result.dng['has_original_raw'])
+                self.assertEqual(result.effective_settings['adobe_pixel_limit'], settings.pixel_limit)
+                self.assertEqual(job.source.path.read_bytes(), source)
+                self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
+
+    def test_retry_is_opt_out_and_does_not_repeat_effort7(self):
+        for effort, enabled in ((9, False), (7, True), (5, True)):
+            with self.subTest(effort=effort, enabled=enabled):
+                job = self.jobs([f'alwaysassert{effort}{enabled}.NEF'], Settings(effort=effort, jxl_retry=enabled))[0]
+                result = self.converter.convert(job)
+                self.assertEqual(result.status, 'error')
+                self.assertEqual(len(self.history(job)), 1)
+                self.assertFalse(job.destination.exists())
+
+    def test_matching_assert_stops_after_one_effort_retry(self):
+        job = self.jobs(['alwaysassert.NEF'], Settings(effort=9))[0]
+        result = self.converter.convert(job)
+        self.assertEqual(result.status, 'error')
+        self.assertEqual(len(self.history(job)), 2)
+        self.assertIsNone(result.effective_settings)
+        self.assertFalse(job.destination.exists())
+        self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
+
+    def test_unrelated_errors_and_successful_logs_do_not_retry(self):
+        for name, status in (('gpuerror.NEF', 'error'), ('otherassert.NEF', 'error'),
+                             ('warningassert.NEF', 'ok'), ('fail.NEF', 'error')):
+            with self.subTest(name=name):
+                job = self.jobs([name], Settings(effort=9, jxl_fallback=True))[0]
+                result = self.converter.convert(job)
+                self.assertEqual(result.status, status, result.message)
+                self.assertEqual(len(self.history(job)), 1)
+
+    def test_lossless_jpeg_fallback_is_opt_in_and_reported(self):
+        job = self.jobs(['alwaysassertfallback.NEF'], Settings(effort=9, jxl_fallback=True))[0]
+        source = job.source.path.read_bytes()
+        result = self.converter.convert(job)
+        self.assertEqual(result.status, 'ok', result.message)
+        self.assertEqual([a.settings['mode'] for a in result.attempts], ['lossy-jxl', 'lossy-jxl', 'lossless-jpeg'])
+        self.assertEqual(result.dng['compression'], 7)
+        self.assertEqual(result.dng['width'] * result.dng['height'], 42000000)
+        self.assertEqual(result.effective_settings['mode'], 'lossless-jpeg')
+        self.assertIsNone(result.effective_settings['adobe_jxl_effort'])
+        self.assertIn('ロスレスJPEGで成功', result.message)
+        self.assertNotIn('-lossy', result.command)
+        self.assertNotIn('-jxl', result.command)
+        self.assertEqual(job.source.path.read_bytes(), source)
+
+    def test_lossless_jxl_does_not_retry_an_ignored_gui_effort(self):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                job = self.jobs([f'alwaysassertlossless{fallback}.NEF'], Settings(mode=Mode.LOSSLESS_JXL, effort=9, jxl_fallback=fallback))[0]
+                result = self.converter.convert(job)
+                self.assertEqual(result.status, 'ok' if fallback else 'error', result.message)
+                self.assertEqual(len(self.history(job)), 2 if fallback else 1)
+                self.assertNotIn('-jxl_effort', result.attempts[0].command)
+
+    def test_partial_output_cannot_masquerade_as_retry_success(self):
+        job = self.jobs(['missingafterassert.NEF'], Settings(effort=9))[0]
+        result = self.converter.convert(job)
+        self.assertEqual(result.status, 'error')
+        self.assertEqual(len(self.history(job)), 2)
+        self.assertIn('DNGを生成しませんでした', result.message)
+        self.assertFalse(job.destination.exists())
+
+    def test_fallback_is_not_used_after_an_unrelated_retry_failure(self):
+        job = self.jobs(['unrelatedafterassert.NEF'], Settings(effort=9, jxl_fallback=True))[0]
+        result = self.converter.convert(job)
+        self.assertEqual(result.status, 'error')
+        self.assertEqual(len(self.history(job)), 2)
+        self.assertFalse(job.destination.exists())
+
+    def test_changed_source_is_rejected_before_retry_process(self):
+        job = self.jobs(['mutatingassert.NEF'], Settings(effort=9))[0]
+        result = self.converter.convert(job)
+        self.assertEqual(result.status, 'error')
+        self.assertIn('入力ファイルが変更', result.message)
+        self.assertEqual(len(self.history(job)), 1)
+        self.assertFalse(job.destination.exists())
+
+    def test_timeout_budget_is_shared_by_retries(self):
+        job = self.jobs(['slowassert.NEF'], Settings(effort=9, jxl_fallback=True, timeout_seconds=0.5))[0]
+        result = self.converter.convert(job)
+        self.assertEqual(result.status, 'error')
+        self.assertIn('タイムアウト', result.message)
+        self.assertEqual(len(self.history(job)), 2)
+        self.assertLess(result.elapsed_seconds, 3)
+        self.assertFalse(job.destination.exists())
+        self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
+
+    def test_cancel_during_retry_terminates_process_and_preserves_pending_jobs(self):
+        jobs = self.jobs(['retryhang.NEF', 'pending.NEF'], Settings(effort=9))
+        cancel = threading.Event()
+        def stop_second_process():
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    if len(self.history(jobs[0])) >= 2:
+                        break
+                except (OSError, ValueError):
+                    pass
+                if cancel.wait(0.02):
+                    return
+            cancel.set()
+        stopper = threading.Thread(target=stop_second_process, daemon=True)
+        stopper.start()
+        try:
+            results, report = run_batch(self.converter, jobs, self.output, cancel)
+        finally:
+            cancel.set()
+            stopper.join(timeout=2)
+        self.assertEqual([r.status for r in results], ['cancelled'])
+        self.assertEqual(len(self.history(jobs[0])), 2)
+        self.assertFalse(any(job.destination.exists() for job in jobs))
+        self.assertEqual(json.loads(report.read_text(encoding='utf-8').splitlines()[-1])['pending'], 1)
+        self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
+
+    def test_report_and_events_include_requested_and_actual_settings(self):
+        jobs = self.jobs(['highassertreport.NEF', 'goodafter.NEF'], Settings(effort=9, megapixels=24))
+        events = []
+        results, report = run_batch(self.converter, jobs, self.output, on_event=lambda kind, data: events.append((kind, data)))
+        self.assertEqual([r.status for r in results], ['ok', 'ok'])
+        retries = [data for kind, data in events if kind == 'retry']
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0]['index'], 0)
+        self.assertEqual(retries[0]['settings']['effort'], 7)
+        records = [json.loads(line) for line in report.read_text(encoding='utf-8').splitlines()]
+        first = records[1]
+        self.assertEqual(first['settings']['effort'], 9)
+        self.assertEqual(first['requested_settings']['effort'], 9)
+        self.assertEqual(first['effective_settings']['effort'], 7)
+        self.assertEqual(len(first['attempts']), 2)
+        self.assertEqual(records[-1]['ok'], 2)
 
     def test_42mp_to_24mp_pipeline_and_raw_metadata(self):
         jobs = self.jobs(["撮影 42MP.NEF"], Settings(megapixels=24, embed_original=True))
@@ -252,6 +459,21 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
             code = main(["convert", str(source), "--output", str(self.output), "--mp", "24", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue())[0]["settings"]["adobe_pixel_limit"], 24000000)
+        self.assertFalse(self.output.exists())
+
+    def test_cli_recovery_options_are_preserved_and_resize_conflict_is_rejected(self):
+        from io import StringIO
+        source = self.jobs(['dryrecovery.NEF'])[0].source.path
+        args = ['convert', str(source), '--output', str(self.output), '--effort', '9',
+                '--no-jxl-retry', '--jxl-fallback', '--dry-run']
+        out = StringIO()
+        with patch('sys.stdout', out):
+            self.assertEqual(main(args), 0)
+        settings = json.loads(out.getvalue())[0]['settings']
+        self.assertFalse(settings['jxl_retry'])
+        self.assertTrue(settings['jxl_fallback'])
+        with patch('sys.stderr', StringIO()):
+            self.assertEqual(main(args + ['--mp', '24']), 2)
         self.assertFalse(self.output.exists())
 
 

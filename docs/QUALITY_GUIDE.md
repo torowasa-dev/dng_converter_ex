@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | 圧縮方式 | 画質指定JPEG XL（Linear DNG） | 同左 |
 | distance | 0.1（最高画質） | 0.3を比較 → 0.5（高画質） |
-| effort | 9（圧縮効率を優先） | 9（圧縮効率を優先） |
+| effort | 7（互換性を優先） | 7。安定動作を確認後に9を比較 |
 | 出力解像度 | 原寸を維持 | 必要な細部を残せるなら24 MP |
 | JPEGプレビュー | なし | なし |
 | Fast Load Data | OFF（初期表示速度との交換） | OFF |
@@ -82,8 +82,8 @@
 | effort | 選び方 |
 | --- | --- |
 | 1 | 変換速度を優先 |
-| 7 | 本アプリの初期値。速度と圧縮効率のバランス |
-| 9 | 変換時間をかけ、圧縮効率を優先 |
+| 7 | 本アプリの初期値。既知assertが出る環境で最初に試す |
+| 9 | 変換時間をかけ、圧縮効率を優先。安定動作を確認して選択 |
 
 effort自体はデコード速度を指定する値ではありません。本アプリの入力範囲はAdobe CLIの範囲です。ロスレスJPEG XLモードはAdobeの固定effortを使用します。
 
@@ -149,6 +149,40 @@ Linear DNGでは、元のモザイクRAWと利用できる機能が異なる場�
 | Adobe DNG Converter | 16以降 |
 | Lightroom Classic / Camera Raw | 13以降 / 16以降（保守的な対象設定） |
 
+## JPEG XLエラー対策
+
+### 画質目標と解像度を維持して回避を試す
+
+特定のヒストグラムassertに限り、effortを下げて一度再試行します。Adobe内蔵版で同じ不具合と確定したものではなく、回避成功を保証しません。
+
+| 項目 | 処理 |
+| --- | --- |
+| 対象エラー | Adobeが異常終了し、enc_ans.cc / JXL_DASSERT / n <= 255が同じ行にある |
+| 初期状態 | 自動再試行ON、ロスレスJPEGへの代替出力OFF |
+| effort再試行 | 画質指定JPEG XLでeffort 8/9の場合のみ、7に変更して一度再試行 |
+| 維持する設定 | distance、MP／長辺、WB必須、プレビュー、元RAW埋め込み等 |
+| 制限時間 | ファイル単位。全試行を合算し、中止操作も継続して有効 |
+| 結果確認 | 要求設定、成功時の設定、各試行の終了コード・ログ末尾・検査結果を記録 |
+
+詳細設定の「互換性優先：effort 7に設定」は、effortと自動再試行だけを変更します。画質と解像度は変更しません。容量が増える場合があり、同じdistanceでも復号画素の完全一致は保証しません。
+
+### 代替出力は原寸指定時だけ
+
+| 設定 | 該当assertが残る場合 |
+| --- | --- |
+| 代替出力OFF | エラーを記録し、次の入力ファイルへ進む |
+| 代替出力ON・原寸 | 元の入力RAWからロスレスJPEG圧縮DNGへ変更。形式変更を結果に表示 |
+| MP／長辺の指定あり | 代替出力は選択不可。縮小指定を勝手に解除しない |
+| ロスレスJPEG XL | GUIのeffort指定はAdobeへ渡らない。effort再試行はせず、選択時だけ代替出力 |
+
+各試行は元の入力から新しいAdobeプロセス・一時フォルダーで実行します。途中DNGを再利用せず、終了とメタデータ検査に成功した出力だけ保存します。失敗時の途中DNGの再圧縮や、旧方式の非可逆JPEGへの自動変更は行いません。
+
+### 既知報告と対策の限界
+
+libjxl #3890は16bit単色・可逆圧縮・effort 8以上での再現報告です。1×1画素でも再現するため、解像度を下げること自体は確実な対策ではありません。effort 7でも失敗する場合のeffort 5は、手動で試す候補にとどめます。
+
+根本対処には、修正を含むAdobe DNG Converterが必要です。Adobeへの修正取り込み状況は未確認です。Pythonパッケージの更新やassertの無効化では、このサイズチェック修正の代替になりません。
+
 ## 使い方・資料
 
 ### 変換の手順
@@ -171,7 +205,7 @@ Linear DNGでは、元のモザイクRAWと利用できる機能が異なる場�
 
 縦横比を維持し、拡大はしません。目標は上限で、整数寸法への丸めにより画素数は厳密には一致しない場合があります。
 
-結果行をダブルクリックすると、実行コマンドと検査情報を表示します。失敗したファイルを記録して次に進み、中止や制限時間超過では未完了の一時出力を破棄します。
+結果行をダブルクリックすると、要求設定・成功時の設定・各試行の実行コマンドと検査情報を表示します。失敗したファイルを記録して次に進み、中止や制限時間超過では未完了の一時出力を破棄します。
 
 ### 原本保護と動作対象
 
@@ -187,6 +221,8 @@ Linear DNGでは、元のモザイクRAWと利用できる機能が異なる場�
 - [Adobe DNG仕様・SDK・CLI資料](https://helpx.adobe.com/camera-raw/desktop/dng-and-file-formats/digital-negative.html)
 - [Adobe DNG Converter CLI仕様 PDF](https://helpx.adobe.com/content/dam/help/en/camera-raw/digital-negative/jcr_content/root/content/flex/items/position/position-par/download_section/download-1/dng_converter_commandline.pdf)
 - [libjxl：distance / effortの仕様](https://libjxl.readthedocs.io/en/latest/api_encoder.html)
+- [libjxl：ヒストグラムassertの既知報告 #3890](https://github.com/libjxl/libjxl/issues/3890)
+- [libjxl：サイズチェックの修正 #3897](https://github.com/libjxl/libjxl/pull/3897)
 - [Adobe SDK：JPEG XL既定設定の実装](https://android.googlesource.com/platform/external/dng_sdk/%2B/68764928faa1d15f76bbf8f03c6e630c570a4354/source/dng_host.cpp)
 - [Adobe SDK：RAW Proxy / Linear DNGの処理](https://android.googlesource.com/platform/external/dng_sdk/%2B/de700ad461e35af50b28b861943a0b0753b10929/source/dng_negative.cpp)
 - [Adobe：RAWとJPEGの明暗・WB編集の違い](https://www.adobe.com/us/learn/lightroom-cc/web/raw-vs-jpeg)

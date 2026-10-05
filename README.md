@@ -17,11 +17,12 @@ Adobe DNG Converterは、PhotoshopのAdobe Camera Rawプラグインとは別の
 - プレビュー、Fast Load Data、元RAW埋め込み、名前・同名処理の設定。
 - 複数のdistanceを比較するDNGを別フォルダーに出力。
 - 元RAWの保護、中止・タイムアウト、失敗後の継続、結果レポート。
+- 特定のJPEG XL assert時、画質・解像度を維持してeffort 7へ限定再試行。原寸時だけ選択式の代替出力。
 - **「画質ガイド / F1」から、明暗の編集耐性や設定の意味をオフラインで確認。**
 
 | 動作条件 | 内容 |
 |---|---|
-| アプリ | 1.1.0 / Python 3.10以降、Tkinter |
+| アプリ | 1.2.0 / Python 3.10以降、Tkinter |
 | 変換を行うOS | Windows / macOS |
 | JPEG XL変換の動作対象 | Adobe DNG Converter 16以降 |
 | JPEG XL編集の動作対象 | Lightroom Classic 13以降 / Camera Raw 16以降 |
@@ -65,6 +66,7 @@ python app.py
 | distance / effort | 数字の意味、画質プリセット、処理時間と圧縮効率 |
 | Adobeとの比較 | 公開SDKから読み取れる既定値の目安と、その適用範囲 |
 | Lightroomで確認 | Kelvin入力、シャドウ・ハイライト・細部・容量の比較 |
+| JPEG XLエラー対策 | 対象assert、effort再試行、原寸時の代替出力、制限と記録 |
 | 使い方・資料 | 変換の手順、原本保護、公式資料へのリンク |
 
 同じ内容を[画質ガイド](docs/QUALITY_GUIDE.md)でも読めます。
@@ -78,7 +80,7 @@ python app.py
 |---|---|---|
 | 圧縮方式 | 画質指定JPEG XL（Linear DNG） | 同左 |
 | distance | 0.1 | 0.3を比較してから0.5 |
-| effort | 9 | 9 |
+| effort | 7（互換性を優先） | 7。安定動作を確認後に9を比較 |
 | 解像度 | 原寸 | 細部の減少を許容するなら24 MP |
 | JPEGプレビュー | なし | なし |
 | Fast Load Data | OFF（初期表示速度との交換） | OFF |
@@ -208,6 +210,34 @@ Adobe GUIの全補助機能を再実装したものではなく、公開CLIの�
 
 ![詳細設定の画面](docs/screenshots/advanced.png)
 
+### JPEG XLのヒストグラムassertを回避する
+
+詳細設定の「JPEG XLのエラー対策」で選択します。初期状態はeffort再試行ON、代替出力OFFです。
+distanceと出力解像度を変えず、圧縮効率の設定だけを下げて回避を試します。
+
+| 項目 | 動作 |
+|---|---|
+| 対象 | Adobeの異常終了と、同じ行の `enc_ans.cc`・`JXL_DASSERT`・`n <= 255` が一致 |
+| 自動再試行 | 画質指定JPEG XLのeffort 8/9から7へ一度だけ変更 |
+| 互換性優先ボタン | effortを7、自動再試行をONに設定。画質・解像度は変更しない |
+| 代替出力 | 選択した場合だけ、該当assertが残る入力を元RAWからロスレスJPEG圧縮DNGへ変更 |
+| 縮小指定あり | 代替出力は選択不可。指定MP／長辺を勝手に解除しない |
+| ロスレスJPEG XL | GUIのeffort値は渡らないためeffort再試行なし。選択した場合だけ代替出力 |
+| 試行上限 | 初回＋effort再試行＋選択式の代替出力で最大3回。制限時間は全試行の合計 |
+| 結果・レポート | 要求設定、成功時の設定、各試行のコマンド・終了コード・ログ末尾（最大16,000バイト相当）を記録 |
+
+各試行には別のAdobeプロセスと一時出力フォルダーを使います。失敗時の途中DNGは採用せず、出力検査に成功してから保存します。
+無関係なエラー、検査失敗、中止、タイムアウトを理由に再試行や代替出力は行いません。
+旧方式の非可逆JPEGへの自動変更も行いません。
+
+![JPEG XLエラー対策のガイド](docs/screenshots/recovery-guide.png)
+
+[libjxl #3890](https://github.com/libjxl/libjxl/issues/3890)は16bit単色・可逆圧縮・effort 8以上の報告です。
+Adobe内蔵版・非可逆DNGで同じ不具合か、effort 7で回避できるかは未確認です。
+同じdistanceでも復号画素の完全一致やファイルサイズは保証しません。effort 5は、7でも失敗する場合の手動試験候補です。
+根本対処には[修正 #3897](https://github.com/libjxl/libjxl/pull/3897)を含むAdobe版が必要で、Pythonパッケージ更新だけでは直りません。
+Adobeへの修正取り込み状況は未確認です。
+
 | 名前の項目 | 意味 |
 |---|---|
 | `{stem}` | 元の名前（拡張子なし） |
@@ -224,13 +254,15 @@ python app.py
 python app.py doctor
 python app.py convert "D:\RAW" --output "D:\DNG" --mp 24 --distance 0.1
 python app.py convert "D:\RAW" --output "D:\DNG" --mode lossless-jpeg
-python app.py compare "D:\RAW\photo.ARW" --output "D:\compare" --mp 24 --distances 0.1,0.3,0.5 --effort 9
+python app.py compare "D:\RAW\photo.ARW" --output "D:\compare" --mp 24 --distances 0.1,0.3,0.5 --effort 7
+python app.py convert "D:\RAW" --output "D:\DNG" --effort 9 --jxl-fallback
 python app.py inspect "D:\DNG\photo.dng"
 python app.py convert "D:\RAW\photo.NEF" --output "D:\DNG" --mp 24 --dry-run
 ```
 
 Adobe実行ファイルは `--converter` または環境変数 `ADOBE_DNG_CONVERTER` でも指定できます。
 CLIでの中止はCtrl+Cです。
+`--no-jxl-retry`でeffort再試行を無効化できます。`--jxl-fallback`は原寸指定時だけ使用できます。
 
 ## Windows用EXEを作る
 
@@ -247,6 +279,7 @@ CLIでの中止はCtrl+Cです。
 | 画質・MPの指定が使えない | 縮小と画質指定には「画質指定JPEG XL」を選択 |
 | LightroomがDNGを読めない | バージョンと機種対応を確認。古い環境ではロスレスJPEGと適切なCamera Raw互換を選択 |
 | 元RAWより容量が大きい | Linear化、低いdistance、ノイズ、プレビュー・RAW埋め込みを確認。縮小・非可逆でも小さくなる保証はない |
+| `enc_ans.cc:... JXL_DASSERT: n <= 255` | effort 7を優先。詳細設定の限定再試行、原寸時の選択式代替出力を確認。Adobe内蔵版での根本修正は未確認 |
 | WB情報不足でエラー | まずカラーRAWと機種対応を確認。モノクロRAWではWB必須の設定を解除できる |
 | 表示できるが色や階調が違う | RAWとDNGのプロファイル・WB・解像度・現像設定を揃える。プレビューだけで判断しない |
 
@@ -272,11 +305,12 @@ python -m unittest discover -s tests -v
 | 原本保護・同名衝突・日本語パス | 模擬コンバーターで確認 |
 | 破損・WB欠落・指定無視の拒否 | 模擬コンバーターで確認 |
 | 中止・タイムアウト・エラー後継続 | 模擬コンバーターで確認 |
+| assertの限定再試行・代替出力・設定記録・部分出力破棄 | 模擬コンバーターで確認 |
 | 実RAW変換・実画質・Lightroom・Kelvin操作 | 未検証 |
 | GUI表示・画質ガイドの開閉と各ページ・スクロール | Linux仮想ディスプレイで確認 |
 | Windows / macOS実行・EXEビルド | 未検証 |
 
-17件のテストが通過しています。合成DNGの圧縮ペイロードはダミーで、画像の正しさを検証するテストではありません。
+32件のテストが通過しています。合成DNGの圧縮ペイロードはダミーで、画像の正しさを検証するテストではありません。
 実機検証が残るため、全機種・Lightroom互換・実画質を検証済みとは扱っていません。
 
 検証の詳細は[VALIDATION.json](VALIDATION.json)、開発・スクリーンショット再生成は[CONTRIBUTING.md](CONTRIBUTING.md)、変更点は[CHANGELOG.md](CHANGELOG.md)を参照してください。

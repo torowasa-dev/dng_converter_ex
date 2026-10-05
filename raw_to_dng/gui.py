@@ -84,6 +84,8 @@ class Application:
         self.linear = tk.BooleanVar(value=False)
         self.strict_wb = tk.BooleanVar(value=True)
         self.preserve_mtime = tk.BooleanVar(value=True)
+        self.jxl_retry = tk.BooleanVar(value=True)
+        self.jxl_fallback = tk.BooleanVar(value=False)
         self.hint = tk.StringVar()
         self.status = tk.StringVar(value="RAWを追加し、出力先を選択してください。")
         self._style()
@@ -227,7 +229,10 @@ class Application:
                                                ("出力名（.dngは自動付加）", self.name_template),
                                                ("開始番号", self.start_index), ("1ファイルの制限時間（秒）", self.timeout)), 3):
             ttk.Label(advanced, text=text).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=4)
-            self._entry(advanced, variable, width=28).grid(row=row, column=1, sticky="w", pady=4)
+            widget = self._entry(advanced, variable, width=28)
+            widget.grid(row=row, column=1, sticky="w", pady=4)
+            if variable is self.effort:
+                self.effort_widget = widget
         ttk.Label(advanced, text="名前の例: {stem} / {index:04d}_{stem} / {date}_{stem} / {stem}_{ext}", style="Muted.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", pady=4)
         checks = ttk.Frame(advanced)
         checks.grid(row=0, column=2, rowspan=7, sticky="nw", padx=(40, 0))
@@ -238,6 +243,16 @@ class Application:
                                ("カラーRAWのWB情報を必須にする", self.strict_wb),
                                ("元ファイルの更新日時を引き継ぐ", self.preserve_mtime)):
             self._check(checks, text, variable).pack(anchor="w", pady=5)
+
+        recovery = ttk.LabelFrame(advanced, text="JPEG XLのエラー対策", padding=8)
+        recovery.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.jxl_retry_widget = self._check(recovery, "該当するassert時、effort 8/9から7へ一度再試行（画質設定・解像度は維持）", self.jxl_retry)
+        self.jxl_retry_widget.grid(row=0, column=0, columnspan=2, sticky="w", pady=3)
+        self.jxl_fallback_widget = self._check(recovery, "該当assertで失敗したら、ロスレスJPEG圧縮DNGへ変更（原寸指定時のみ）", self.jxl_fallback)
+        self.jxl_fallback_widget.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
+        self.effort_7_button = self._button(recovery, "互換性優先：effort 7に設定", self._prefer_effort7)
+        self.effort_7_button.grid(row=2, column=0, sticky="w", pady=(5, 0))
+        ttk.Label(recovery, text="画質設定・解像度は変更しません。詳しくは画質ガイド。", style="Muted.TLabel").grid(row=2, column=1, sticky="w", padx=12)
 
         action = ttk.Frame(outer)
         action.pack(fill="x", pady=12)
@@ -346,12 +361,25 @@ class Application:
         if hasattr(self, "quality_widget"):
             self.quality_widget.configure(state="readonly" if jxl and not self.busy else "disabled")
             self.distance_widget.configure(state="normal" if jxl and not self.busy else "disabled")
+            self.effort_widget.configure(state="normal" if jxl and not self.busy else "disabled")
+            self.jxl_retry_widget.configure(state="normal" if jxl and not self.busy else "disabled")
+            self.effort_7_button.configure(state="normal" if jxl and not self.busy else "disabled")
+            fallback_allowed = mode in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL) and self.resize.get() == "原寸を維持"
+            if not fallback_allowed:
+                self.jxl_fallback.set(False)
+            self.jxl_fallback_widget.configure(state="normal" if fallback_allowed and not self.busy else "disabled")
             self.mp_widget.configure(state="normal" if self.resize.get() == "画素数で指定（MP）" and not self.busy else "disabled")
             self.side_widget.configure(state="normal" if self.resize.get() == "長辺で指定（px）" and not self.busy else "disabled")
         if mode in (Mode.LOSSY_JXL, Mode.LOSSY_JPEG):
             self.hint.set("Linear DNGを出力します。縮小と非可逆圧縮は元に戻せません。Kelvin編集用のRAW/WBタグを検査します。JPEG XLはLightroom Classic 13 / Camera Raw 16以降を対象とします。")
         else:
             self.hint.set("原寸のRAW情報を優先するモードです。縮小する場合は画質指定JPEG XLを選択してください。入力RAWは削除しません。")
+            if mode == Mode.LOSSLESS_JXL:
+                self.hint.set(self.hint.get() + " このモードではGUIのeffort指定は適用されません。")
+
+    def _prefer_effort7(self) -> None:
+        self.effort.set("7")
+        self.jxl_retry.set(True)
 
     def _collect_settings(self) -> Settings:
         settings = Settings(
@@ -363,6 +391,7 @@ class Application:
             compatibility=self.compatibility.get(), collision={"連番を付ける": "rename", "スキップ": "skip", "上書き": "overwrite"}[self.collision.get()],
             name_template=self.name_template.get(), timeout_seconds=float(self.timeout.get()),
             strict_wb=self.strict_wb.get(), preserve_mtime=self.preserve_mtime.get(),
+            jxl_retry=self.jxl_retry.get(), jxl_fallback=self.jxl_fallback.get(),
         )
         settings.validate()
         return settings
@@ -458,6 +487,11 @@ class Application:
                     self.result_tree.set(str(data["index"]), "state", "変換中")
                     self.result_tree.see(str(data["index"]))
                     self.status.set("変換中: " + Path(data["source"]).name)
+                elif kind == "retry":
+                    iid = str(data["index"])
+                    self.result_tree.set(iid, "state", "再試行中")
+                    self.result_tree.set(iid, "message", data["message"])
+                    self.status.set("再試行中: " + Path(data["source"]).name + " / " + data["message"])
                 elif kind == "result":
                     iid = str(data["index"])
                     info = data.get("dng") or {}
@@ -465,6 +499,8 @@ class Application:
                     size = f"{data['output_bytes'] / 1_000_000:.2f} MB" if data.get("output_bytes") else ""
                     ratio = f"{data['size_ratio']:.1%}" if data.get("size_ratio") is not None and info else ""
                     state = {"ok": "完了", "error": "エラー", "skipped": "スキップ", "cancelled": "中止"}[data["status"]]
+                    if data["status"] == "ok" and len(data.get("attempts", [])) > 1:
+                        state = "完了（再試行）"
                     self.result_tree.item(iid, values=(Path(data["source"]).name, state, dims, size, ratio, data["message"].replace("\n", " ")))
                     self.result_details[iid] = data
                     self.progress.configure(value=data["index"] + 1)
@@ -540,7 +576,8 @@ class Application:
     def _saved_names():
         return ("converter", "output", "mode", "quality", "distance", "effort", "resize", "megapixels", "long_edge", "preview",
                 "compatibility", "collision", "name_template", "start_index", "timeout", "recursive", "preserve_folders",
-                "include_dng", "fast_load", "embed_original", "linear", "strict_wb", "preserve_mtime")
+                "include_dng", "fast_load", "embed_original", "linear", "strict_wb", "preserve_mtime",
+                "jxl_retry", "jxl_fallback")
 
     def _save_settings(self) -> None:
         try:

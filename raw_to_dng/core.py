@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -35,6 +35,20 @@ class ConversionError(RuntimeError):
 
 class Cancelled(ConversionError):
     pass
+
+
+class AdobeProcessError(ConversionError):
+    """A nonzero Adobe exit, distinct from validation/cancellation failures."""
+
+    def __init__(self, exit_code: int, output: str):
+        self.exit_code = exit_code
+        self.output = output
+        super().__init__(f"Adobe変換エラー: exit={exit_code}\n{output}")
+
+
+def is_jxl_histogram_assert(output: str) -> bool:
+    """Match the reported assertion, not unrelated Adobe/GPU failures."""
+    return re.search(r"enc_ans\.cc[^\r\n]*\bJXL_DASSERT\b[^\r\n]*\bn\s*<=\s*255\b", output) is not None
 
 
 class Mode(str, Enum):
@@ -71,6 +85,8 @@ class Settings:
     timeout_seconds: float = 1800.0
     strict_wb: bool = True
     preserve_mtime: bool = True
+    jxl_retry: bool = True
+    jxl_fallback: bool = False
 
     @property
     def pixel_limit(self) -> int | None:
@@ -91,6 +107,10 @@ class Settings:
             raise ValueError("MP指定と長辺指定はどちらか一方を選んでください。")
         if (self.megapixels is not None or self.long_edge is not None) and self.mode not in (Mode.LOSSY_JXL, Mode.LOSSY_JPEG):
             raise ValueError("縮小には画質指定JPEG XL、または非可逆JPEGのモードを選んでください。")
+        if not isinstance(self.jxl_retry, bool) or not isinstance(self.jxl_fallback, bool):
+            raise ValueError("JPEG XLの再試行・代替出力はON/OFFで指定してください。")
+        if self.jxl_fallback and (self.megapixels is not None or self.long_edge is not None):
+            raise ValueError("ロスレスJPEGへの代替出力は原寸指定時だけ使用できます。縮小指定を維持する場合はOFFにしてください。")
         if self.preview not in (0, 1, 2):
             raise ValueError("プレビューは0（なし）・1（中）・2（全画素）です。")
         if self.compatibility not in COMPATIBILITIES:
@@ -146,6 +166,8 @@ class Settings:
         result = asdict(self)
         result["mode"] = self.mode.value
         result["adobe_pixel_limit"] = self.pixel_limit
+        result["adobe_jxl_effort"] = self.effort if self.mode == Mode.LOSSY_JXL else None
+        result["adobe_jxl_distance"] = self.distance if self.mode == Mode.LOSSY_JXL else None
         return result
 
 
@@ -364,6 +386,19 @@ def publish(stage: Path, target: Path, policy: str) -> Path | None:
 
 
 @dataclass
+class Attempt:
+    number: int
+    reason: str
+    settings: dict[str, Any]
+    command: list[str] = field(default_factory=list)
+    status: str = "error"
+    exit_code: int | None = None
+    log: str = ""
+    message: str = ""
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
 class Result:
     source: str
     destination: str
@@ -374,6 +409,9 @@ class Result:
     elapsed_seconds: float = 0.0
     command: list[str] = field(default_factory=list)
     dng: dict[str, Any] | None = None
+    requested_settings: dict[str, Any] | None = None
+    effective_settings: dict[str, Any] | None = None
+    attempts: list[Attempt] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -397,10 +435,98 @@ class Converter:
             process.kill()
             process.wait(timeout=5)
 
-    def convert(self, job: Job, cancel: threading.Event | None = None) -> Result:
+    @staticmethod
+    def _check_running(cancel: threading.Event, started: float, timeout: float) -> None:
+        if cancel.is_set():
+            raise Cancelled("変換を中止しました。")
+        if time.monotonic() - started >= timeout:
+            raise ConversionError(f"タイムアウト（{timeout:g}秒。再試行を含む）。")
+
+    @staticmethod
+    def _check_source(job: Job, source_stat: os.stat_result) -> None:
+        current = job.source.path.stat()
+        if (source_stat.st_size, source_stat.st_mtime_ns) != (current.st_size, current.st_mtime_ns):
+            raise ConversionError("変換中に入力ファイルが変更されたため、出力を採用しません。")
+
+    def _attempt(self, job: Job, settings: Settings, cancel: threading.Event,
+                 started: float, source_stat: os.stat_result, result: Result,
+                 reason: str) -> None:
+        attempt_started = time.monotonic()
+        attempt = Attempt(len(result.attempts) + 1, reason, settings.to_dict())
+        result.attempts.append(attempt)
+        try:
+            self._check_running(cancel, started, job.settings.timeout_seconds)
+            self._check_source(job, source_stat)
+            # Each attempt has a fresh process, log and output directory. A failed
+            # Adobe run may leave a partial DNG that must never be reused.
+            with tempfile.TemporaryDirectory(prefix=".raw-to-dng-", dir=job.destination.parent) as temporary:
+                stage = Path(temporary) / "converted.dng"
+                attempt.command = [str(self.executable), *settings.adobe_flags(), "-d", temporary,
+                                   "-o", stage.name, str(job.source.path)]
+                result.command = attempt.command.copy()
+                with tempfile.TemporaryFile() as log:
+                    kwargs: dict[str, Any] = {}
+                    if os.name == "nt":
+                        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                    process = None
+                    try:
+                        process = subprocess.Popen(attempt.command, stdout=log, stderr=subprocess.STDOUT,
+                                                   stdin=subprocess.DEVNULL, shell=False, **kwargs)
+                        while process.poll() is None:
+                            cancel.wait(0.15)
+                            self._check_running(cancel, started, job.settings.timeout_seconds)
+                    except BaseException:
+                        if process is not None:
+                            self._stop(process)
+                        raise
+                    finally:
+                        if process is not None:
+                            attempt.exit_code = process.returncode
+                        log.seek(0, os.SEEK_END)
+                        log.seek(max(0, log.tell() - 16000))
+                        attempt.log = log.read().decode("utf-8", "replace").strip()
+                self._check_running(cancel, started, job.settings.timeout_seconds)
+                if attempt.exit_code:
+                    raise AdobeProcessError(attempt.exit_code, attempt.log)
+                if not stage.is_file():
+                    raise ConversionError("AdobeがDNGを生成しませんでした。未対応機種・RAW破損・変換指定を確認してください。\n" + attempt.log)
+                self._check_source(job, source_stat)
+                info = inspect_dng(stage)
+                verify_output(info, settings)
+                if settings.preserve_mtime:
+                    os.utime(stage, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+                self._check_running(cancel, started, job.settings.timeout_seconds)
+                self._check_source(job, source_stat)
+                final = publish(stage, job.destination, settings.collision)
+                if final is None:
+                    result.status, result.message = "skipped", "変換中に同名出力が作成されたためスキップ。"
+                else:
+                    result.status, result.destination = "ok", str(final)
+                    result.output_bytes = info.file_size
+                    result.dng = info.to_dict()
+                    result.dng["path"] = str(final)
+                    result.effective_settings = settings.to_dict()
+                    result.message = f"{info.width}×{info.height} / {info.megapixels:.2f} MP / {info.compression_name}"
+                    if settings.mode != job.settings.mode:
+                        result.message += " / JPEG XL失敗 → ロスレスJPEGで成功（原寸）"
+                    elif settings.effort != job.settings.effort:
+                        result.message += f" / effort {job.settings.effort}→{settings.effort}で再試行成功"
+                attempt.status, attempt.message = result.status, result.message
+        except Cancelled as exc:
+            attempt.status, attempt.message = "cancelled", str(exc)
+            raise
+        except Exception as exc:
+            attempt.status, attempt.message = "error", str(exc)
+            raise
+        finally:
+            attempt.elapsed_seconds = round(time.monotonic() - attempt_started, 3)
+
+    def convert(self, job: Job, cancel: threading.Event | None = None,
+                on_retry: Callable[[dict[str, Any]], None] | None = None) -> Result:
         cancel = cancel or threading.Event()
         started = time.monotonic()
         result = Result(str(job.source.path), str(job.destination), "error")
+        result.requested_settings = job.settings.to_dict()
         try:
             settings = job.settings
             settings.validate()
@@ -417,54 +543,34 @@ class Converter:
                 result.status, result.message = "skipped", "同名出力があるためスキップ。"
                 return result
             job.destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix=".raw-to-dng-", dir=job.destination.parent) as temporary:
-                stage = Path(temporary) / "converted.dng"
-                result.command = [str(self.executable), *settings.adobe_flags(), "-d", temporary,
-                                  "-o", stage.name, str(job.source.path)]
-                with tempfile.TemporaryFile() as log:
-                    kwargs: dict[str, Any] = {}
-                    if os.name == "nt":
-                        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                    process = subprocess.Popen(result.command, stdout=log, stderr=subprocess.STDOUT,
-                                               stdin=subprocess.DEVNULL, shell=False, **kwargs)
-                    try:
-                        while process.poll() is None:
-                            if cancel.wait(0.15):
-                                raise Cancelled("変換を中止しました。")
-                            if time.monotonic() - started > settings.timeout_seconds:
-                                raise ConversionError(f"タイムアウト（{settings.timeout_seconds:g}秒）。")
-                    except BaseException:
-                        self._stop(process)
+            reason = "初回"
+            # At most: requested effort -> effort 7 -> opt-in lossless JPEG.
+            # Effort 5 remains a manual experiment, not a verified workaround.
+            for _ in range(3):
+                try:
+                    self._attempt(job, settings, cancel, started, source_stat, result, reason)
+                    break
+                except AdobeProcessError as exc:
+                    if settings.mode not in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL) or not is_jxl_histogram_assert(exc.output):
                         raise
-                    log.seek(0, os.SEEK_END)
-                    log.seek(max(0, log.tell() - 16000))
-                    output = log.read().decode("utf-8", "replace").strip()
-                    if process.returncode:
-                        raise ConversionError(f"Adobe変換エラー: exit={process.returncode}\n{output}")
-                    if not stage.is_file():
-                        raise ConversionError("AdobeがDNGを生成しませんでした。未対応機種・RAW破損・変換指定を確認してください。\n" + output)
-                if cancel.is_set():
-                    raise Cancelled("出力確定前に中止しました。")
-                if (source_stat.st_size, source_stat.st_mtime_ns) != (job.source.path.stat().st_size, job.source.path.stat().st_mtime_ns):
-                    raise ConversionError("変換中に入力ファイルが変更されたため、出力を採用しません。")
-                info = inspect_dng(stage)
-                verify_output(info, settings)
-                if settings.preserve_mtime:
-                    os.utime(stage, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
-                final = publish(stage, job.destination, settings.collision)
-                if final is None:
-                    result.status, result.message = "skipped", "変換中に同名出力が作成されたためスキップ。"
-                else:
-                    result.status, result.destination = "ok", str(final)
-                    result.output_bytes = info.file_size
-                    result.dng = info.to_dict()
-                    result.dng["path"] = str(final)
-                    result.message = f"{info.width}×{info.height} / {info.megapixels:.2f} MP / {info.compression_name}"
+                    if settings.mode == Mode.LOSSY_JXL and settings.jxl_retry and settings.effort > 7:
+                        reason = f"effort {settings.effort}→7で再試行"
+                        settings = replace(settings, effort=7)
+                    elif settings.jxl_fallback:
+                        reason = "ロスレスJPEGへ変更（原寸）"
+                        settings = replace(settings, mode=Mode.LOSSLESS_JPEG, jxl_retry=False, jxl_fallback=False)
+                    else:
+                        raise
+                    if on_retry:
+                        on_retry({"attempt": len(result.attempts) + 1, "message": reason,
+                                  "settings": settings.to_dict()})
         except Cancelled as exc:
             result.status, result.message = "cancelled", str(exc)
         except Exception as exc:
             # One unusual file must not terminate the remaining batch or the GUI.
             result.status, result.message = "error", str(exc)
+            if len(result.attempts) > 1:
+                result.message = f"再試行を含む{len(result.attempts)}回の変換に失敗しました。\n" + result.message
         finally:
             result.elapsed_seconds = round(time.monotonic() - started, 3)
         return result
@@ -491,7 +597,8 @@ def run_batch(converter: Converter, jobs: list[Job], report_directory: str | Pat
             if cancel.is_set():
                 break
             event("start", {"index": index, "source": str(job.source.path)})
-            result = converter.convert(job, cancel)
+            result = converter.convert(job, cancel, on_retry=lambda data: event(
+                "retry", {"index": index, "source": str(job.source.path), **data}))
             results.append(result)
             data = {"type": "result", "index": index, "settings": job.settings.to_dict(), **result.to_dict()}
             record(data)

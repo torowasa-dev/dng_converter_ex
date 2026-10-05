@@ -25,6 +25,8 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=[mode.value for mode in Mode], default=Mode.LOSSY_JXL.value)
     parser.add_argument("--distance", type=float, default=0.1, help="JPEG XL画質: 0〜6、小さいほど高画質")
     parser.add_argument("--effort", type=int, default=7)
+    parser.add_argument("--no-jxl-retry", action="store_true", help="該当assert時のeffort 8/9→7再試行を無効化")
+    parser.add_argument("--jxl-fallback", action="store_true", help="該当assert時にロスレスJPEGへ変更（原寸指定時のみ）")
     resolution = parser.add_mutually_exclusive_group()
     resolution.add_argument("--megapixels", "--mp", type=float, help="上限MP。24は2400万画素")
     resolution.add_argument("--long-edge", type=int, help="上限長辺px")
@@ -70,7 +72,8 @@ def _settings(args) -> Settings:
                       embed_original=args.embed_original, linear=args.linear,
                       compatibility=args.compatibility, collision=args.collision,
                       name_template=args.name_template, timeout_seconds=args.timeout,
-                      strict_wb=not args.allow_missing_wb, preserve_mtime=not args.no_preserve_mtime)
+                      strict_wb=not args.allow_missing_wb, preserve_mtime=not args.no_preserve_mtime,
+                      jxl_retry=not args.no_jxl_retry, jxl_fallback=args.jxl_fallback)
     result.validate()
     return result
 
@@ -130,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
         def event(kind: str, data: dict) -> None:
             if kind == "result":
                 print(f"[{data['status']}] {Path(data['source']).name}: {data['message']}", flush=True)
+            elif kind == "retry":
+                print(f"[再試行 {data['attempt']}] {Path(data['source']).name}: {data['message']}", flush=True)
             elif kind == "done":
                 print(f"report: {data['report']}", flush=True)
         try:
