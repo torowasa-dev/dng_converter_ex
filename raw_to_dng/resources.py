@@ -35,11 +35,13 @@ class ProcessControl:
     def _priority(self, process) -> None:
         if self.priority == "normal":
             return
+        current = process.nice()
         if sys.platform == "win32":
             value = self.api.BELOW_NORMAL_PRIORITY_CLASS if self.priority == "low" else self.api.IDLE_PRIORITY_CLASS
         else:
-            value = max(process.nice(), 10 if self.priority == "low" else 19)
-        process.nice(value)
+            value = max(current, 10 if self.priority == "low" else 19)
+        if current != value:
+            process.nice(value)
 
     def _snapshot(self):
         try:
@@ -50,7 +52,6 @@ class ProcessControl:
             try:
                 key = (process.pid, process.create_time())
                 if key not in self._processes:
-                    self._priority(process)
                     self._processes[key] = process
             except self.api.NoSuchProcess:
                 pass
@@ -60,6 +61,9 @@ class ProcessControl:
                 if not process.is_running():
                     del self._processes[key]
                     continue
+                # A converter can reset its priority during startup or create
+                # children later. Keep the user's selection throughout the run.
+                self._priority(process)
                 usage = process.cpu_times()
                 self._totals[key] = max(self._totals.get(key, 0), usage.user + usage.system)
                 active.append(process)

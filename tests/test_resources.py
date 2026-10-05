@@ -83,6 +83,16 @@ class ResourceTests(unittest.TestCase):
         self.assertGreaterEqual(clock.value, 0.29)
         self.assertFalse(root.paused)
 
+    def test_priority_is_restored_after_startup_and_applied_to_later_children(self):
+        root, clock = FakeProcess(1), FakeClock()
+        with patch('raw_to_dng.resources.sys.platform', 'linux'):
+            control = self.control(root, clock, limit=100)
+            root.priority = -10
+            child = FakeProcess(2)
+            root.descendants = [child]
+            control.update(FakeEvent(clock), lambda: None)
+        self.assertEqual((root.priority, child.priority), (10, 10))
+
     def test_cancel_during_throttle_always_resumes_all_processes(self):
         child, clock = FakeProcess(2), FakeClock()
         root = FakeProcess(1, [child])
