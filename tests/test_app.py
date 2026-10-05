@@ -144,7 +144,7 @@ class PlanningTests(unittest.TestCase):
         output.mkdir()
         (output / "old.dng").write_bytes(b"previous")
         sources = scan_inputs([self.base], include_dng=True, exclude_directory=output)
-        self.assertEqual([item.path for item in sources], [source])
+        self.assertEqual([item.path for item in sources], [source.resolve()])
         jobs = plan_jobs(sources, output, Settings())
         self.assertEqual(jobs[0].destination.parent.name, "写真")
 
@@ -179,9 +179,7 @@ if source.stem.startswith('warningassert'):
     print(assertion, file=sys.stderr)
 if jxl and source.stem.startswith('retryhang') and effort == 7:
     time.sleep(8)
-if jxl and source.stem.startswith('slowassert'):
-    time.sleep(0.3)
-should_assert = jxl and (source.stem.startswith(('alwaysassert', 'slowassert')) or
+should_assert = jxl and (source.stem.startswith('alwaysassert') or
     source.stem.startswith(('effort8success', 'unrelatedafterassert')) and effort is not None and effort > 8 or
     source.stem.startswith(('highassert', 'retryhang', 'mutatingassert', 'missingafterassert')) and effort is not None and effort > 7)
 if should_assert:
@@ -426,12 +424,18 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         self.assertFalse(job.destination.exists())
 
     def test_timeout_budget_is_shared_by_retries(self):
-        job = self.jobs(['slowassert.NEF'], Settings(effort=9, jxl_fallback=True, timeout_seconds=0.5))[0]
-        result = self.converter.convert(job)
+        job = self.jobs(['alwaysasserttimeout.NEF'], Settings(effort=9, jxl_fallback=True, timeout_seconds=0.5))[0]
+        clock = [100.0]
+        def advance_after_failure(_data):
+            clock[0] += 0.3
+        # Advance a controlled clock between failed processes so slow startup
+        # cannot consume the test budget before the retry is actually exercised.
+        with patch('raw_to_dng.core.time.monotonic', side_effect=lambda: clock[0]):
+            result = self.converter.convert(job, on_retry=advance_after_failure)
         self.assertEqual(result.status, 'error')
         self.assertIn('タイムアウト', result.message)
         self.assertEqual(len(self.history(job)), 2)
-        self.assertLess(result.elapsed_seconds, 3)
+        self.assertAlmostEqual(result.elapsed_seconds, 0.6)
         self.assertFalse(job.destination.exists())
         self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
 
