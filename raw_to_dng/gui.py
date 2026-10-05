@@ -84,6 +84,7 @@ class Application:
         self.linear = tk.BooleanVar(value=False)
         self.strict_wb = tk.BooleanVar(value=True)
         self.preserve_mtime = tk.BooleanVar(value=True)
+        self.skip_existing = tk.BooleanVar(value=False)
         self.jxl_retry = tk.BooleanVar(value=True)
         self.jxl_fallback = tk.BooleanVar(value=False)
         self.hint = tk.StringVar()
@@ -221,10 +222,13 @@ class Application:
         advanced.columnconfigure(1, weight=1)
         rows = (("JPEGプレビュー", self.preview, ("なし", "中サイズ", "全画素")),
                 ("Camera Raw互換（JPEG XL以外）", self.compatibility, COMPATIBILITIES),
-                ("同名ファイル", self.collision, ("連番を付ける", "スキップ", "上書き")))
+                ("スキップOFF時の同名処理", self.collision, ("連番を付ける", "上書き")))
         for row, (text, variable, values) in enumerate(rows):
             ttk.Label(advanced, text=text).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=4)
-            self._combo(advanced, variable, values, 26).grid(row=row, column=1, sticky="w", pady=4)
+            widget = self._combo(advanced, variable, values, 26)
+            widget.grid(row=row, column=1, sticky="w", pady=4)
+            if variable is self.collision:
+                self.collision_widget = widget
         for row, (text, variable) in enumerate((("JPEG XL effort（1＝高速、9＝低速）", self.effort),
                                                ("出力名（.dngは自動付加）", self.name_template),
                                                ("開始番号", self.start_index), ("1ファイルの制限時間（秒）", self.timeout)), 3):
@@ -236,13 +240,18 @@ class Application:
         ttk.Label(advanced, text="名前の例: {stem} / {index:04d}_{stem} / {date}_{stem} / {stem}_{ext}", style="Muted.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", pady=4)
         checks = ttk.Frame(advanced)
         checks.grid(row=0, column=2, rowspan=7, sticky="nw", padx=(40, 0))
-        for text, variable in (("出力でフォルダー構造を維持", self.preserve_folders),
+        for text, variable in (("出力先に同名ファイルがあればスキップ", self.skip_existing),
+                               ("出力でフォルダー構造を維持", self.preserve_folders),
                                ("Fast Load Dataを埋め込む", self.fast_load),
                                ("元RAWをDNG内に埋め込む（容量増）", self.embed_original),
                                ("ロスレス／無圧縮でもLinear DNGにする", self.linear),
                                ("カラーRAWのWB情報を必須にする", self.strict_wb),
                                ("元ファイルの更新日時を引き継ぐ", self.preserve_mtime)):
-            self._check(checks, text, variable).pack(anchor="w", pady=5)
+            widget = self._check(checks, text, variable)
+            widget.pack(anchor="w", pady=5)
+            if variable is self.skip_existing:
+                self.skip_existing_widget = widget
+                widget.configure(command=self._settings_changed)
 
         recovery = ttk.LabelFrame(advanced, text="JPEG XLのエラー対策", padding=8)
         recovery.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -359,6 +368,7 @@ class Application:
         mode = self._selected_mode()
         jxl = mode == Mode.LOSSY_JXL
         if hasattr(self, "quality_widget"):
+            self.collision_widget.configure(state="disabled" if self.skip_existing.get() or self.busy else "readonly")
             self.quality_widget.configure(state="readonly" if jxl and not self.busy else "disabled")
             self.distance_widget.configure(state="normal" if jxl and not self.busy else "disabled")
             self.effort_widget.configure(state="normal" if jxl and not self.busy else "disabled")
@@ -388,7 +398,8 @@ class Application:
             long_edge=int(self.long_edge.get()) if self.resize.get() == "長辺で指定（px）" else None,
             preview={"なし": 0, "中サイズ": 1, "全画素": 2}[self.preview.get()],
             fast_load=self.fast_load.get(), embed_original=self.embed_original.get(), linear=self.linear.get(),
-            compatibility=self.compatibility.get(), collision={"連番を付ける": "rename", "スキップ": "skip", "上書き": "overwrite"}[self.collision.get()],
+            compatibility=self.compatibility.get(),
+            collision="skip" if self.skip_existing.get() else {"連番を付ける": "rename", "上書き": "overwrite"}[self.collision.get()],
             name_template=self.name_template.get(), timeout_seconds=float(self.timeout.get()),
             strict_wb=self.strict_wb.get(), preserve_mtime=self.preserve_mtime.get(),
             jxl_retry=self.jxl_retry.get(), jxl_fallback=self.jxl_fallback.get(),
@@ -564,6 +575,10 @@ class Application:
                     getattr(self, name).set(data[name])
             if self.mode.get() not in MODE_LABELS.values():
                 self.mode.set(MODE_LABELS[Mode.LOSSY_JXL])
+            if self.collision.get() == "スキップ":
+                # Migrate preferences saved before the dedicated checkbox existed.
+                self.skip_existing.set(True)
+                self.collision.set("連番を付ける")
         except (OSError, ValueError, TypeError, tk.TclError):
             pass
         if not self.converter.get():
@@ -577,7 +592,7 @@ class Application:
         return ("converter", "output", "mode", "quality", "distance", "effort", "resize", "megapixels", "long_edge", "preview",
                 "compatibility", "collision", "name_template", "start_index", "timeout", "recursive", "preserve_folders",
                 "include_dng", "fast_load", "embed_original", "linear", "strict_wb", "preserve_mtime",
-                "jxl_retry", "jxl_fallback")
+                "skip_existing", "jxl_retry", "jxl_fallback")
 
     def _save_settings(self) -> None:
         try:

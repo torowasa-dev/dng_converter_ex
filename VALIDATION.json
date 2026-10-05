@@ -1,9 +1,9 @@
 {
-  "created_utc": "2026-10-05T04:26:13.124687+00:00",
+  "created_utc": "2026-10-05T07:34:35.548223+00:00",
   "project_name": "DngConverterEx",
-  "app_version": "1.2.1",
+  "app_version": "1.2.2",
   "automated_tests": {
-    "passed": 33,
+    "passed": 35,
     "failed": 0,
     "command": "python3 -m unittest discover -s tests -v",
     "python": "3.12.14"
@@ -29,6 +29,14 @@
       "controls disabled while busy",
       "stepwise retry progress",
       "retry completion",
+      "skip default OFF",
+      "checkbox applies skip",
+      "unchecked rename and overwrite restored",
+      "collision policy disabled while skip is ON",
+      "skip disabled while busy",
+      "skip preference save and restore",
+      "legacy skip preference migration",
+      "unrelated settings unchanged",
       "progress bar visible"
     ],
     "actual_screenshots": [
@@ -68,7 +76,7 @@
         ]
       }
     ],
-    "visual_review": "Japanese text and controls reviewed on the two updated screenshots (advanced and recovery guide). The other three screenshots are byte-for-byte unchanged from 1.2.0."
+    "visual_review": "Japanese text and the dedicated skip checkbox reviewed on the updated advanced-settings screenshot. The other four screenshots are byte-for-byte unchanged from 1.2.1."
   },
   "documentation": {
     "relative_links": "pass",
@@ -76,7 +84,7 @@
     "python_310_syntax": "pass",
     "version_consistency": "pass"
   },
-  "tested": "Synthetic DNG metadata and real simulated processes: stepwise targeted-assert retries (9 to 8 to 7 and 8 to 7), stop on effort 8 success, bounded opt-in fallback, unchanged quality/resolution, fresh staging, shared timeout, cancellation, source protection, per-attempt settings/logs, CLI options; actual Tkinter controls, saved preferences, guide navigation and stepwise retry progress on Linux.",
+  "tested": "Synthetic DNG metadata and real simulated processes: existing-output skip starts no conversion and preserves existing bytes/mtime, subsequent inputs continue, unchecked rename/overwrite convert normally, targeted-assert stepwise retries, opt-in fallback, unchanged quality/resolution, fresh staging, shared timeout, cancellation, source protection, per-attempt settings/logs, CLI options; actual Tkinter skip checkbox, control enable/disable, saved preferences, legacy skip preference migration, guide navigation and retry progress on Linux.",
   "not_tested": [
     "Actual Adobe DNG Converter",
     "Workaround on the reported RAW file",

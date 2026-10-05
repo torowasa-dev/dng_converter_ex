@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "DngConverterEx"
-version = "1.2.1"
+version = "1.2.2"
 description = "Desktop Adobe DNG Converter front end with JPEG XL quality and MP resize controls"
 requires-python = ">=3.10"
 dependencies = []

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import sys
 import tempfile
@@ -71,6 +72,37 @@ def main() -> int:
                 capture(root, screenshots / "main.png")
                 app.notebook.select(1)
                 capture(root, screenshots / "advanced.png")
+                assert not app.skip_existing.get(), 'Existing output skip must default to OFF'
+                for label, policy in (('連番を付ける', 'rename'), ('上書き', 'overwrite')):
+                    app.collision.set(label)
+                    app.skip_existing_widget.invoke()
+                    assert app._collect_settings() == replace(before, collision='skip'), 'Skip checkbox was not applied'
+                    assert 'disabled' in app.collision_widget.state(), 'Skip must disable the alternate collision policy'
+                    app._set_busy(True)
+                    assert 'disabled' in app.skip_existing_widget.state(), 'Skip checkbox changed while busy'
+                    app._set_busy(False)
+                    assert 'disabled' in app.collision_widget.state(), 'Skip collision policy enabled after busy state'
+                    app.skip_existing_widget.invoke()
+                    assert app._collect_settings() == replace(before, collision=policy), 'Unchecked policy was not restored'
+                    assert 'disabled' not in app.collision_widget.state(), 'Unchecked collision policy is disabled'
+                app.skip_existing_widget.invoke()
+                app._save_settings()
+                saved = json.loads(settings_file.read_text(encoding='utf-8'))
+                assert saved['skip_existing'] and saved['collision'] == '上書き', 'Skip preference was not saved'
+                app.skip_existing.set(False)
+                app.collision.set('連番を付ける')
+                app._load_settings()
+                app._settings_changed()
+                assert app.skip_existing.get() and app.collision.get() == '上書き', 'Skip preference was not restored'
+                settings_file.write_text(json.dumps({'collision': 'スキップ'}, ensure_ascii=False), encoding='utf-8')
+                app.skip_existing.set(False)
+                app._load_settings()
+                app._settings_changed()
+                assert app.skip_existing.get() and app.collision.get() == '連番を付ける', 'Legacy skip preference was not migrated'
+                assert app._collect_settings() == replace(before, collision='skip'), 'Legacy skip policy was lost'
+                settings_file.unlink()
+                app.skip_existing_widget.invoke()
+                assert app._collect_settings() == before, 'Skip checks changed unrelated conversion settings'
                 assert 'disabled' in app.jxl_fallback_widget.state(), 'Resized outputs must disable fallback'
                 app.resize.set('原寸を維持')
                 app._settings_changed()
@@ -176,6 +208,9 @@ def main() -> int:
                                "help entry", "available while busy", "conversion settings unchanged", "no user preferences changed"],
                     "recovery_checks": ["effort 7 preset", "fallback disabled and cleared for resize", "lossless JXL effort disabled",
                                         "preferences save and restore", "controls disabled while busy", "stepwise retry progress", "retry completion"],
+                    "skip_checks": ["skip default OFF", "checkbox applies skip", "unchecked rename and overwrite restored",
+                                    "collision policy disabled while skip is ON", "skip disabled while busy",
+                                    "skip preference save and restore", "legacy skip preference migration", "unrelated settings unchanged"],
                     "adobe_conversion_run": False,
                 }, ensure_ascii=False, indent=2))
             finally:

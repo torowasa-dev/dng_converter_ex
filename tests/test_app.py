@@ -238,6 +238,42 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
     def history(self, job):
         return [json.loads(line) for line in job.source.path.with_suffix('.attempts.jsonl').read_text(encoding='utf-8').splitlines()]
 
+    def test_existing_output_skips_conversion_and_batch_continues(self):
+        jobs = self.jobs(['already.NEF', 'new.NEF'], Settings(collision='skip'))
+        self.output.mkdir()
+        existing = jobs[0].destination
+        existing.write_bytes(b'existing output unchanged')
+        stat = existing.stat()
+        results, report = run_batch(self.converter, jobs, self.output)
+        self.assertEqual([r.status for r in results], ['skipped', 'ok'])
+        self.assertEqual(results[0].attempts, [])
+        self.assertFalse(jobs[0].source.path.with_suffix('.attempts.jsonl').exists())
+        self.assertEqual(existing.read_bytes(), b'existing output unchanged')
+        self.assertEqual(existing.stat().st_mtime_ns, stat.st_mtime_ns)
+        self.assertFalse(existing.with_name('already_001.dng').exists())
+        self.assertEqual(len(self.history(jobs[1])), 1)
+        records = [json.loads(line) for line in report.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(records[1]['requested_settings']['collision'], 'skip')
+        self.assertEqual(records[-1]['skipped'], 1)
+        self.assertEqual(records[-1]['ok'], 1)
+
+    def test_existing_output_is_converted_when_skip_is_disabled(self):
+        for collision in ('rename', 'overwrite'):
+            with self.subTest(collision=collision):
+                job = self.jobs([f'{collision}.NEF'], Settings(collision=collision))[0]
+                self.output.mkdir(exist_ok=True)
+                job.destination.write_bytes(b'previous output')
+                result = self.converter.convert(job)
+                self.assertEqual(result.status, 'ok', result.message)
+                self.assertEqual(len(self.history(job)), 1)
+                self.assertTrue(Path(result.destination).is_file())
+                if collision == 'rename':
+                    self.assertEqual(job.destination.read_bytes(), b'previous output')
+                    self.assertNotEqual(Path(result.destination), job.destination)
+                else:
+                    self.assertEqual(Path(result.destination), job.destination)
+                    self.assertNotEqual(job.destination.read_bytes(), b'previous output')
+
     def test_assert_retry_preserves_distance_resolution_and_metadata(self):
         cases = [(effort, resolution) for effort in (8, 9)
                  for resolution in ({'megapixels': 24}, {'long_edge': 5000})]
