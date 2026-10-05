@@ -1,3 +1,3 @@
 """DngConverterEx: an Adobe DNG Converter front end."""
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"

@@ -25,6 +25,8 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=[mode.value for mode in Mode], default=Mode.LOSSY_JXL.value)
     parser.add_argument("--distance", type=float, default=0.1, help="JPEG XL画質: 0〜6、小さいほど高画質")
     parser.add_argument("--effort", type=int, default=7)
+    parser.add_argument("--priority", choices=("normal", "low", "idle"), default="normal", help="変換プロセスの優先度")
+    parser.add_argument("--cpu-limit", type=int, default=100, help="全論理CPUに対する使用率上限の目安（1〜100%%）")
     parser.add_argument("--no-jxl-retry", action="store_true", help="該当assert時のeffort段階再試行（9→8→7）を無効化")
     parser.add_argument("--jxl-fallback", action="store_true", help="該当assert時にロスレスJPEGへ変更（原寸指定時のみ）")
     resolution = parser.add_mutually_exclusive_group()
@@ -73,7 +75,8 @@ def _settings(args) -> Settings:
                       compatibility=args.compatibility, collision=args.collision,
                       name_template=args.name_template, timeout_seconds=args.timeout,
                       strict_wb=not args.allow_missing_wb, preserve_mtime=not args.no_preserve_mtime,
-                      jxl_retry=not args.no_jxl_retry, jxl_fallback=args.jxl_fallback)
+                      jxl_retry=not args.no_jxl_retry, jxl_fallback=args.jxl_fallback,
+                      priority=args.priority, cpu_limit=args.cpu_limit)
     result.validate()
     return result
 

@@ -33,6 +33,7 @@ class SettingsTests(unittest.TestCase):
                          Settings(megapixels=24, long_edge=6000),
                          Settings(distance=float("nan")), Settings(distance=7),
                          Settings(timeout_seconds=0), Settings(effort=0),
+                         Settings(priority='unknown'), Settings(cpu_limit=0), Settings(cpu_limit=101), Settings(cpu_limit=True),
                          Settings(name_template="../{stem}"), Settings(name_template="{stem.__class__}"),
                          Settings(name_template="{index:999999999d}")):
             with self.subTest(settings=settings):
@@ -319,6 +320,32 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         self.assertEqual(result.effective_settings['distance'], 0.2)
         self.assertIn('effort 9→8', result.message)
         self.assertEqual([r['settings']['effort'] for r in retries], [8])
+
+    def test_resource_settings_are_applied_to_each_retry_without_changing_quality(self):
+        settings = Settings(effort=9, distance=0.2, megapixels=24, priority='low', cpu_limit=50)
+        job = self.jobs(['highassertresources.NEF'], settings)[0]
+        with patch('raw_to_dng.core.ProcessControl') as control:
+            control.return_value.__enter__.return_value.enabled = True
+            result = self.converter.convert(job)
+        self.assertEqual(result.status, 'ok', result.message)
+        self.assertEqual(control.call_count, 3)
+        for call in control.call_args_list:
+            self.assertEqual(call.args[1:], ('low', 50))
+        for attempt in result.attempts:
+            self.assertEqual((attempt.settings['priority'], attempt.settings['cpu_limit']), ('low', 50))
+            self.assertEqual((attempt.settings['distance'], attempt.settings['megapixels']), (0.2, 24))
+
+    def test_cli_resource_options_are_recorded_without_adobe_flags(self):
+        from io import StringIO
+        source = self.jobs(['dryresources.NEF'])[0].source.path
+        out = StringIO()
+        with patch('sys.stdout', out):
+            code = main(['convert', str(source), '--output', str(self.output), '--dry-run',
+                         '--priority', 'idle', '--cpu-limit', '25'])
+        self.assertEqual(code, 0)
+        data = json.loads(out.getvalue())[0]
+        self.assertEqual((data['settings']['priority'], data['settings']['cpu_limit']), ('idle', 25))
+        self.assertNotIn('--cpu-limit', data['adobe_flags'])
 
     def test_retry_is_opt_out_and_does_not_repeat_effort7(self):
         for effort, enabled in ((9, False), (7, True), (5, True)):

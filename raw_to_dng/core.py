@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
+from .resources import PRIORITY_LABELS, ProcessControl
 from .dng import DngError, DngInfo, inspect_dng
 
 
@@ -87,6 +88,8 @@ class Settings:
     preserve_mtime: bool = True
     jxl_retry: bool = True
     jxl_fallback: bool = False
+    priority: str = "normal"
+    cpu_limit: int = 100
 
     @property
     def pixel_limit(self) -> int | None:
@@ -95,6 +98,10 @@ class Settings:
     def validate(self) -> None:
         if not isinstance(self.mode, Mode):
             raise ValueError("圧縮方式が不正です。")
+        if self.priority not in PRIORITY_LABELS:
+            raise ValueError("プロセス優先度が不正です。")
+        if type(self.cpu_limit) is not int or not 1 <= self.cpu_limit <= 100:
+            raise ValueError("CPU使用率の上限は1〜100%です。")
         if not math.isfinite(self.distance) or not 0 <= self.distance <= 6:
             raise ValueError("JPEG XL distanceは0〜6です。小さいほど高画質です。")
         if not isinstance(self.effort, int) or not 1 <= self.effort <= 9:
@@ -472,9 +479,13 @@ class Converter:
                     try:
                         process = subprocess.Popen(attempt.command, stdout=log, stderr=subprocess.STDOUT,
                                                    stdin=subprocess.DEVNULL, shell=False, **kwargs)
-                        while process.poll() is None:
-                            cancel.wait(0.15)
-                            self._check_running(cancel, started, job.settings.timeout_seconds)
+                        with ProcessControl(process.pid, settings.priority, settings.cpu_limit) as control:
+                            if (settings.priority != "normal" or settings.cpu_limit < 100) and not control.enabled and process.poll() is None:
+                                raise ConversionError("変換プロセスのCPU・優先度を制御できませんでした。")
+                            while process.poll() is None:
+                                cancel.wait(0.15)
+                                self._check_running(cancel, started, job.settings.timeout_seconds)
+                                control.update(cancel, lambda: self._check_running(cancel, started, job.settings.timeout_seconds))
                     except BaseException:
                         if process is not None:
                             self._stop(process)

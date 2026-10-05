@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "DngConverterEx"
-version = "1.2.2"
+version = "1.3.0"
 description = "Desktop Adobe DNG Converter front end with JPEG XL quality and MP resize controls"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["psutil>=5.9.6,<8"]
 readme = "README.md"
 license = {file = "LICENSE.txt"}
 keywords = ["raw", "dng", "jpeg-xl", "photography", "tkinter"]

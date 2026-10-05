@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo Building a desktop GUI executable on Windows...
-py -3 -m pip install pyinstaller
+py -3 -m pip install . pyinstaller
 if errorlevel 1 goto failed
 py -3 -m PyInstaller --noconfirm --clean --onedir --windowed --name DngConverterEx DngConverterEx.pyw
 if errorlevel 1 goto failed

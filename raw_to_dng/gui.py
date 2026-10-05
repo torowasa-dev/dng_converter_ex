@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from dataclasses import replace
@@ -21,6 +22,8 @@ from .core import (
     Converter, Mode, Settings, plan_jobs, resolve_converter, run_batch, scan_inputs,
 )
 from .guide import QualityGuide
+from .progress import BatchProgress
+from .resources import PRIORITY_LABELS
 
 QUALITY_PRESETS = {
     "最高画質": 0.1, "高画質": 0.5, "標準": 1.0,
@@ -58,6 +61,7 @@ class Application:
         self.cancel = threading.Event()
         self.worker: threading.Thread | None = None
         self.busy = False
+        self.batch_progress = BatchProgress()
         self.last_report: Path | None = None
         self.quality_guide: QualityGuide | None = None
         self.widgets_to_disable: list[tk.Widget] = []
@@ -85,10 +89,13 @@ class Application:
         self.strict_wb = tk.BooleanVar(value=True)
         self.preserve_mtime = tk.BooleanVar(value=True)
         self.skip_existing = tk.BooleanVar(value=False)
+        self.priority = tk.StringVar(value=PRIORITY_LABELS["normal"])
+        self.cpu_limit = tk.StringVar(value="100")
         self.jxl_retry = tk.BooleanVar(value=True)
         self.jxl_fallback = tk.BooleanVar(value=False)
         self.hint = tk.StringVar()
         self.status = tk.StringVar(value="RAWを追加し、出力先を選択してください。")
+        self.progress_summary = tk.StringVar(value=self.batch_progress.summary(time.monotonic()))
         self._style()
         self._load_settings()
         self._build()
@@ -168,16 +175,16 @@ class Application:
         inputs = ttk.LabelFrame(main, text="入力 RAW / DNG", padding=10)
         inputs.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         bar = ttk.Frame(inputs)
-        bar.pack(fill="x", pady=(0, 8))
+        bar.pack(fill="x", pady=(0, 6))
         for text, command in (("ファイルを追加", self._choose_files), ("フォルダーを追加", self._choose_folder),
                               ("選択を削除", self._remove_selected), ("クリア", self._clear_inputs)):
             self._button(bar, text, command).pack(side="left", padx=(0, 4))
-        self.input_tree = ttk.Treeview(inputs, columns=("path",), show="headings", height=7, selectmode="extended")
+        self.input_tree = ttk.Treeview(inputs, columns=("path",), show="headings", height=4, selectmode="extended")
         self.input_tree.heading("path", text="入力パス（フォルダーは変換開始時に走査）")
         self.input_tree.column("path", width=470)
         self.input_tree.pack(fill="both", expand=True)
         toggles = ttk.Frame(inputs)
-        toggles.pack(fill="x", pady=(8, 0))
+        toggles.pack(fill="x", pady=(6, 0))
         self._check(toggles, "サブフォルダーも対象", self.recursive).pack(anchor="w")
         self._check(toggles, "フォルダー走査でDNGも対象にする", self.include_dng).pack(anchor="w")
 
@@ -217,31 +224,32 @@ class Application:
         ttk.Label(output, text="出力先").pack(side="left")
         self._entry(output, self.output).pack(side="left", fill="x", expand=True, padx=8)
         self._button(output, "フォルダー選択", self._choose_output).pack(side="left")
-        ttk.Label(main, textvariable=self.hint, wraplength=1020, style="Muted.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.skip_existing_widget = self._check(main, "出力先に同名ファイルがあればスキップ", self.skip_existing)
+        self.skip_existing_widget.configure(command=self._settings_changed)
+        self.skip_existing_widget.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(main, textvariable=self.hint, wraplength=1020, style="Muted.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         advanced.columnconfigure(1, weight=1)
         rows = (("JPEGプレビュー", self.preview, ("なし", "中サイズ", "全画素")),
                 ("Camera Raw互換（JPEG XL以外）", self.compatibility, COMPATIBILITIES),
                 ("スキップOFF時の同名処理", self.collision, ("連番を付ける", "上書き")))
         for row, (text, variable, values) in enumerate(rows):
-            ttk.Label(advanced, text=text).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=4)
+            ttk.Label(advanced, text=text).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=3)
             widget = self._combo(advanced, variable, values, 26)
-            widget.grid(row=row, column=1, sticky="w", pady=4)
+            widget.grid(row=row, column=1, sticky="w", pady=3)
             if variable is self.collision:
                 self.collision_widget = widget
         for row, (text, variable) in enumerate((("JPEG XL effort（1＝高速、9＝低速）", self.effort),
                                                ("出力名（.dngは自動付加）", self.name_template),
                                                ("開始番号", self.start_index), ("1ファイルの制限時間（秒）", self.timeout)), 3):
-            ttk.Label(advanced, text=text).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=4)
+            ttk.Label(advanced, text=text).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=3)
             widget = self._entry(advanced, variable, width=28)
-            widget.grid(row=row, column=1, sticky="w", pady=4)
+            widget.grid(row=row, column=1, sticky="w", pady=3)
             if variable is self.effort:
                 self.effort_widget = widget
-        ttk.Label(advanced, text="名前の例: {stem} / {index:04d}_{stem} / {date}_{stem} / {stem}_{ext}", style="Muted.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", pady=4)
         checks = ttk.Frame(advanced)
         checks.grid(row=0, column=2, rowspan=7, sticky="nw", padx=(40, 0))
-        for text, variable in (("出力先に同名ファイルがあればスキップ", self.skip_existing),
-                               ("出力でフォルダー構造を維持", self.preserve_folders),
+        for text, variable in (("出力でフォルダー構造を維持", self.preserve_folders),
                                ("Fast Load Dataを埋め込む", self.fast_load),
                                ("元RAWをDNG内に埋め込む（容量増）", self.embed_original),
                                ("ロスレス／無圧縮でもLinear DNGにする", self.linear),
@@ -249,9 +257,18 @@ class Application:
                                ("元ファイルの更新日時を引き継ぐ", self.preserve_mtime)):
             widget = self._check(checks, text, variable)
             widget.pack(anchor="w", pady=5)
-            if variable is self.skip_existing:
-                self.skip_existing_widget = widget
-                widget.configure(command=self._settings_changed)
+
+        resources = ttk.Frame(advanced)
+        resources.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(resources, text="変換プロセスの優先度").pack(side="left")
+        self.priority_widget = self._combo(resources, self.priority, PRIORITY_LABELS.values(), 12)
+        self.priority_widget.pack(side="left", padx=(8, 24))
+        ttk.Label(resources, text="CPU上限（目安）").pack(side="left")
+        self.cpu_limit_widget = ttk.Spinbox(resources, from_=1, to=100, increment=5, textvariable=self.cpu_limit, width=6)
+        self.widgets_to_disable.append(self.cpu_limit_widget)
+        self.cpu_limit_widget.pack(side="left", padx=(8, 4))
+        ttk.Label(resources, text="%").pack(side="left")
+        ttk.Label(resources, text="100%＝制限なし。PC全体のCPU比。", style="Muted.TLabel").pack(side="left", padx=(16, 0))
 
         recovery = ttk.LabelFrame(advanced, text="JPEG XLのエラー対策", padding=8)
         recovery.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -276,15 +293,19 @@ class Application:
 
         footer = ttk.Frame(outer)
         footer.pack(side="bottom", fill="x", pady=(8, 0))
-        self.progress = ttk.Progressbar(footer, mode="determinate")
-        self.progress.pack(fill="x", pady=(0, 4))
+        progress_row = ttk.Frame(footer)
+        progress_row.pack(fill="x", pady=(0, 4))
+        self.progress_summary_widget = ttk.Label(progress_row, textvariable=self.progress_summary)
+        self.progress_summary_widget.pack(side="left")
+        self.progress = ttk.Progressbar(progress_row, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(12, 0))
         ttk.Label(footer, textvariable=self.status, style="Muted.TLabel", wraplength=1040).pack(anchor="w")
 
         results_frame = ttk.Frame(outer)
         results_frame.pack(fill="both", expand=True)
         columns = ("file", "state", "resolution", "size", "ratio", "message")
         self.result_tree = ttk.Treeview(results_frame, columns=columns, show="headings", height=7)
-        for key, label, width in zip(columns, ("ファイル", "状態", "出力解像度", "容量", "出力/入力", "結果"), (230, 80, 170, 100, 85, 370)):
+        for key, label, width in zip(columns, ("ファイル", "状態", "出力解像度", "容量", "出力/入力", "結果"), (230, 120, 170, 100, 85, 370)):
             self.result_tree.heading(key, text=label)
             self.result_tree.column(key, width=width, minwidth=55, stretch=key in ("file", "message"))
         scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=self.result_tree.yview)
@@ -403,6 +424,8 @@ class Application:
             name_template=self.name_template.get(), timeout_seconds=float(self.timeout.get()),
             strict_wb=self.strict_wb.get(), preserve_mtime=self.preserve_mtime.get(),
             jxl_retry=self.jxl_retry.get(), jxl_fallback=self.jxl_fallback.get(),
+            priority=next(key for key, label in PRIORITY_LABELS.items() if label == self.priority.get()),
+            cpu_limit=int(self.cpu_limit.get()),
         )
         settings.validate()
         return settings
@@ -455,6 +478,8 @@ class Application:
             self._set_busy(True)
             self.progress.configure(mode="indeterminate")
             self.progress.start(15)
+            self.batch_progress = BatchProgress()
+            self.progress_summary.set("全数 走査中 / 残件数 — / 残り時間 —")
             self.status.set("入力RAWを走査しています…")
 
             def worker() -> None:
@@ -475,7 +500,8 @@ class Application:
                             tag = format(distance, ".8g").replace(".", "p")
                             folder = output / ("quality_d" + tag)
                             jobs.extend(plan_jobs(sources, folder, replace(settings, distance=distance), False, start_index))
-                    self.events.put(("planned", {"jobs": jobs}))
+                    work = [not (job.settings.collision == "skip" and job.destination.exists()) for job in jobs]
+                    self.events.put(("planned", {"jobs": jobs, "work": work}))
                     run_batch(converter, jobs, output, self.cancel,
                               lambda kind, data: self.events.put((kind, data)))
                 except Exception as exc:
@@ -490,11 +516,13 @@ class Application:
             while True:
                 kind, data = self.events.get_nowait()
                 if kind == "planned":
+                    self.batch_progress.plan(data["work"])
                     self.progress.stop()
                     self.progress.configure(mode="determinate", maximum=len(data["jobs"]), value=0)
                     for index, job in enumerate(data["jobs"]):
                         self.result_tree.insert("", "end", iid=str(index), values=(job.source.path.name, "待機", "", "", "", str(job.destination)))
                 elif kind == "start":
+                    self.batch_progress.start(data["index"], time.monotonic())
                     self.result_tree.set(str(data["index"]), "state", "変換中")
                     self.result_tree.see(str(data["index"]))
                     self.status.set("変換中: " + Path(data["source"]).name)
@@ -504,6 +532,8 @@ class Application:
                     self.result_tree.set(iid, "message", data["message"])
                     self.status.set("再試行中: " + Path(data["source"]).name + " / " + data["message"])
                 elif kind == "result":
+                    self.batch_progress.result(data["index"], data["status"],
+                                               data.get("elapsed_seconds", 0), bool(data.get("attempts")))
                     iid = str(data["index"])
                     info = data.get("dng") or {}
                     dims = f"{info['width']}×{info['height']} ({info['megapixels']:.2f} MP)" if info else ""
@@ -516,6 +546,7 @@ class Application:
                     self.result_details[iid] = data
                     self.progress.configure(value=data["index"] + 1)
                 elif kind == "done":
+                    self.batch_progress.stopped = data["cancelled"]
                     self.last_report = Path(data["report"])
                     self._set_busy(False)
                     for iid in self.result_tree.get_children():
@@ -523,6 +554,7 @@ class Application:
                             self.result_tree.set(iid, "state", "未処理")
                     self.status.set(f"完了 {data['ok']} / エラー {data['errors']} / スキップ {data['skipped']} / 未処理 {data['pending']}。詳細レポート: {self.last_report.name}")
                 elif kind in ("fatal", "aborted"):
+                    self.batch_progress.stopped = True
                     self.progress.stop()
                     self._set_busy(False)
                     self.status.set(data["message"])
@@ -530,9 +562,14 @@ class Application:
                         messagebox.showerror("変換処理", data["message"], parent=self.root)
         except queue.Empty:
             pass
+        if self.batch_progress.planned:
+            self.progress_summary.set(self.batch_progress.summary(time.monotonic()))
+        elif not self.busy:
+            self.progress_summary.set(self.batch_progress.summary(time.monotonic()))
         self.root.after(100, self._poll)
 
     def _cancel(self) -> None:
+        self.batch_progress.stopped = True
         self.cancel.set()
         self.cancel_button.configure(state="disabled")
         self.status.set("中止しています。未完了の一時DNGを破棄します…")
@@ -579,6 +616,8 @@ class Application:
                 # Migrate preferences saved before the dedicated checkbox existed.
                 self.skip_existing.set(True)
                 self.collision.set("連番を付ける")
+            if self.priority.get() not in PRIORITY_LABELS.values():
+                self.priority.set(PRIORITY_LABELS["normal"])
         except (OSError, ValueError, TypeError, tk.TclError):
             pass
         if not self.converter.get():
@@ -592,7 +631,7 @@ class Application:
         return ("converter", "output", "mode", "quality", "distance", "effort", "resize", "megapixels", "long_edge", "preview",
                 "compatibility", "collision", "name_template", "start_index", "timeout", "recursive", "preserve_folders",
                 "include_dng", "fast_load", "embed_original", "linear", "strict_wb", "preserve_mtime",
-                "skip_existing", "jxl_retry", "jxl_fallback")
+                "skip_existing", "jxl_retry", "jxl_fallback", "priority", "cpu_limit")
 
     def _save_settings(self) -> None:
         try:

@@ -184,11 +184,25 @@ HELP_PAGES = (
         ), (30, 70)),
         Paragraph("縦横比を維持し、拡大はしません。目標は上限で、整数寸法への丸めにより画素数は厳密には一致しない場合があります。"),
         Paragraph("結果行をダブルクリックすると、要求設定・成功時の設定・各試行の実行コマンドと検査情報を表示します。失敗したファイルを記録して次に進み、中止や制限時間超過では未完了の一時出力を破棄します。"),
+        Paragraph("全件数・残件数・残り時間", heading=True),
+        Table(("表示", "計算方法"), (
+            ("全数", "入力走査後に確定する出力予定件数。画質比較では各distanceの出力を数える"),
+            ("残件数", "処理が終わっていない件数。成功・スキップ・失敗で減り、再試行では増えない"),
+            ("残り時間", "終了した変換の平均所要時間から推定。最初の変換が終わるまでは計算中"),
+        ), (25, 75)),
+        Paragraph("プログレスバーの横に常時表示します。再試行時間を同じ1件に含め、予定スキップを変換時間の見積もりから除外します。ファイルや設定によって時間が変わるため、残り時間は目安です。中止時は推定を停止し、次の実行ではリセットします。"),
+        Paragraph("変換の処理負荷", heading=True),
+        Table(("詳細設定", "意味"), (
+            ("優先度", "通常／低め／最低。低め・最低では、ほかのアプリへCPUを譲りやすくする"),
+            ("CPU上限（目安）", "PC全論理CPUに対する変換プロセスの平均使用率。1〜100%、100%は制限なし"),
+            ("制御方法", "変換プロセスと子プロセスのCPU時間を測り、超過時は一時停止・再開して調整する"),
+        ), (25, 75)),
+        Paragraph("瞬間的なCPU使用率は上限を超える場合があります。画質・解像度は変更しませんが、変換時間は長くなります。待機時間もファイルの制限時間に含まれます。"),
         Paragraph("原本保護と動作対象", heading=True),
         Paragraph("入力RAWを削除・変更しません。初期状態では同名出力に連番を付けます。"),
-        Table(("既存の出力ファイル", "詳細設定での指定"), (
-            ("変換をスキップ", "「出力先に同名ファイルがあればスキップ」をON。既存ファイルを保持し、次の入力へ進む"),
-            ("連番付加／上書き", "チェックOFF（初期状態）で「スキップOFF時の同名処理」を選択"),
+        Table(("既存の出力ファイル", "設定する場所"), (
+            ("変換をスキップ", "変換設定の出力先欄の下で「出力先に同名ファイルがあればスキップ」をON。既存ファイルを保持し、次の入力へ進む"),
+            ("連番付加／上書き", "チェックOFF（初期状態）で、詳細設定の「スキップOFF時の同名処理」を選択"),
             ("設定の保存", "チェック状態とOFF時の同名処理を保存。旧版のスキップ設定も引き継ぐ"),
         ), (25, 75)),
         Paragraph("Adobeの公式変換はWindows / macOSが対象で、LinuxでAdobeによるネイティブ変換を行う機能はありません。"),
@@ -196,19 +210,3 @@ HELP_PAGES = (
         Paragraph("以下は公式資料とAdobe SDKの公開実装です。本文はオフラインで読めます。参考リンクを開くとブラウザーを使用します。"),
     )),
 )
-
-
-def markdown_guide() -> str:
-    """Export exactly the guide content, so the app and repository stay aligned."""
-    parts = ["# 画質ガイド", "アプリの「画質ガイド / F1」と同じ説明です。推奨値は比較開始の目安であり、実画質や容量の保証値ではありません。"]
-    for page in HELP_PAGES:
-        parts.append("## " + page.title)
-        for block in page.blocks:
-            if isinstance(block, Paragraph):
-                parts.append(("### " if block.heading else "") + block.text)
-            else:
-                def row(values):
-                    return "| " + " | ".join(value.replace("|", "\\|").replace("\n", "<br>") for value in values) + " |"
-                parts.append("\n".join([row(block.headers), row(tuple("---" for _ in block.headers)), *(row(values) for values in block.rows)]))
-    parts.extend(("## 参考資料", "\n".join(f"- [{title}]({url})" for title, url in REFERENCES)))
-    return "\n\n".join(parts) + "\n"
