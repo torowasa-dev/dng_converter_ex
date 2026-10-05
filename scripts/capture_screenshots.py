@@ -102,11 +102,13 @@ def main() -> int:
                 app.notebook.select(0)
 
                 app.result_tree.insert('', 'end', iid='0', values=('sample.NEF', '変換中', '', '', '', ''))
-                app.events.put(('retry', {'index': 0, 'source': 'sample.NEF', 'message': 'effort 9→7で再試行'}))
-                app._poll()
-                assert app.result_tree.set('0', 'state') == '再試行中', 'Retry progress was not shown'
+                for message in ('effort 9→8で再試行', 'effort 8→7で再試行'):
+                    app.events.put(('retry', {'index': 0, 'source': 'sample.NEF', 'message': message}))
+                    app._poll()
+                    assert app.result_tree.set('0', 'state') == '再試行中', 'Retry progress was not shown'
+                    assert message in app.status.get(), 'Current effort step was not shown'
                 app.events.put(('result', {'index': 0, 'source': 'sample.NEF', 'status': 'ok',
-                                          'message': 'effort 9→7で再試行成功', 'attempts': [{}, {}]}))
+                                          'message': 'effort 9→8→7で再試行成功', 'attempts': [{}, {}, {}]}))
                 app._poll()
                 assert app.result_tree.set('0', 'state') == '完了（再試行）', 'Retry completion was not shown'
                 app.result_tree.delete('0')
@@ -173,7 +175,7 @@ def main() -> int:
                     "checks": ["F1", "all pages", "wheel scrolling", "window reuse", "reopen", "Escape",
                                "help entry", "available while busy", "conversion settings unchanged", "no user preferences changed"],
                     "recovery_checks": ["effort 7 preset", "fallback disabled and cleared for resize", "lossless JXL effort disabled",
-                                        "preferences save and restore", "controls disabled while busy", "retry progress", "retry completion"],
+                                        "preferences save and restore", "controls disabled while busy", "stepwise retry progress", "retry completion"],
                     "adobe_conversion_run": False,
                 }, ensure_ascii=False, indent=2))
             finally:

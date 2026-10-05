@@ -510,7 +510,8 @@ class Converter:
                     if settings.mode != job.settings.mode:
                         result.message += " / JPEG XL失敗 → ロスレスJPEGで成功（原寸）"
                     elif settings.effort != job.settings.effort:
-                        result.message += f" / effort {job.settings.effort}→{settings.effort}で再試行成功"
+                        efforts = "→".join(str(a.settings["effort"]) for a in result.attempts)
+                        result.message += f" / effort {efforts}で再試行成功"
                 attempt.status, attempt.message = result.status, result.message
         except Cancelled as exc:
             attempt.status, attempt.message = "cancelled", str(exc)
@@ -544,9 +545,9 @@ class Converter:
                 return result
             job.destination.parent.mkdir(parents=True, exist_ok=True)
             reason = "初回"
-            # At most: requested effort -> effort 7 -> opt-in lossless JPEG.
+            # At most: effort 9 -> 8 -> 7 -> opt-in lossless JPEG.
             # Effort 5 remains a manual experiment, not a verified workaround.
-            for _ in range(3):
+            for _ in range(4):
                 try:
                     self._attempt(job, settings, cancel, started, source_stat, result, reason)
                     break
@@ -554,8 +555,9 @@ class Converter:
                     if settings.mode not in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL) or not is_jxl_histogram_assert(exc.output):
                         raise
                     if settings.mode == Mode.LOSSY_JXL and settings.jxl_retry and settings.effort > 7:
-                        reason = f"effort {settings.effort}→7で再試行"
-                        settings = replace(settings, effort=7)
+                        next_effort = settings.effort - 1
+                        reason = f"effort {settings.effort}→{next_effort}で再試行"
+                        settings = replace(settings, effort=next_effort)
                     elif settings.jxl_fallback:
                         reason = "ロスレスJPEGへ変更（原寸）"
                         settings = replace(settings, mode=Mode.LOSSLESS_JPEG, jxl_retry=False, jxl_fallback=False)

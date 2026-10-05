@@ -246,7 +246,7 @@ class Application:
 
         recovery = ttk.LabelFrame(advanced, text="JPEG XLのエラー対策", padding=8)
         recovery.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        self.jxl_retry_widget = self._check(recovery, "該当するassert時、effort 8/9から7へ一度再試行（画質設定・解像度は維持）", self.jxl_retry)
+        self.jxl_retry_widget = self._check(recovery, "該当するassert時、effortを1ずつ下げて再試行（9→8→7。画質設定・解像度は維持）", self.jxl_retry)
         self.jxl_retry_widget.grid(row=0, column=0, columnspan=2, sticky="w", pady=3)
         self.jxl_fallback_widget = self._check(recovery, "該当assertで失敗したら、ロスレスJPEG圧縮DNGへ変更（原寸指定時のみ）", self.jxl_fallback)
         self.jxl_fallback_widget.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)

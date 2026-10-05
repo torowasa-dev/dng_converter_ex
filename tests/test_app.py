@@ -181,7 +181,8 @@ if jxl and source.stem.startswith('retryhang') and effort == 7:
 if jxl and source.stem.startswith('slowassert'):
     time.sleep(0.3)
 should_assert = jxl and (source.stem.startswith(('alwaysassert', 'slowassert')) or
-    source.stem.startswith(('highassert', 'retryhang', 'mutatingassert', 'missingafterassert', 'unrelatedafterassert')) and effort is not None and effort > 7)
+    source.stem.startswith(('effort8success', 'unrelatedafterassert')) and effort is not None and effort > 8 or
+    source.stem.startswith(('highassert', 'retryhang', 'mutatingassert', 'missingafterassert')) and effort is not None and effort > 7)
 if should_assert:
     dest.write_bytes(b'partial output from failed Adobe run')
     if source.stem.startswith('mutatingassert'):
@@ -238,22 +239,27 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         return [json.loads(line) for line in job.source.path.with_suffix('.attempts.jsonl').read_text(encoding='utf-8').splitlines()]
 
     def test_assert_retry_preserves_distance_resolution_and_metadata(self):
-        for resolution in ({'megapixels': 24}, {'long_edge': 5000}):
-            with self.subTest(resolution=resolution):
-                settings = Settings(distance=0.2, effort=9, embed_original=True, **resolution)
-                job = self.jobs(['highassert' + next(iter(resolution)) + '.NEF'], settings)[0]
+        cases = [(effort, resolution) for effort in (8, 9)
+                 for resolution in ({'megapixels': 24}, {'long_edge': 5000})]
+        for effort, resolution in cases:
+            with self.subTest(effort=effort, resolution=resolution):
+                settings = Settings(distance=0.2, effort=effort, embed_original=True, **resolution)
+                job = self.jobs([f'highassert{effort}' + next(iter(resolution)) + '.NEF'], settings)[0]
                 source = job.source.path.read_bytes()
                 result = self.converter.convert(job)
+                expected_efforts = list(range(effort, 6, -1))
+                count = len(expected_efforts)
                 self.assertEqual(result.status, 'ok', result.message)
-                self.assertEqual([a.settings['effort'] for a in result.attempts], [9, 7])
-                self.assertEqual([a.exit_code for a in result.attempts], [7, 0])
-                self.assertEqual(result.requested_settings['effort'], 9)
+                self.assertEqual([a.settings['effort'] for a in result.attempts], expected_efforts)
+                self.assertEqual([a.exit_code for a in result.attempts], [7] * (count - 1) + [0])
+                self.assertEqual(result.requested_settings['effort'], effort)
                 self.assertEqual(result.effective_settings['effort'], 7)
-                self.assertIn('effort 9→7', result.message)
-                self.assertIn('JXL_DASSERT', result.attempts[0].log)
+                self.assertIn('effort ' + '→'.join(map(str, expected_efforts)), result.message)
+                for attempt in result.attempts[:-1]:
+                    self.assertIn('JXL_DASSERT', attempt.log)
                 history = self.history(job)
-                self.assertEqual(len({h['stage'] for h in history}), 2)
-                self.assertEqual(len({h['pid'] for h in history}), 2)
+                self.assertEqual(len({h['stage'] for h in history}), count)
+                self.assertEqual(len({h['pid'] for h in history}), count)
                 for h in history:
                     args = h['args']
                     self.assertEqual(args[args.index('-jxl_distance') + 1], '0.2')
@@ -265,6 +271,19 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
                 self.assertEqual(job.source.path.read_bytes(), source)
                 self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
 
+    def test_retry_stops_at_effort8_success_before_effort7_or_fallback(self):
+        job = self.jobs(['effort8success.NEF'], Settings(effort=9, distance=0.2, jxl_fallback=True))[0]
+        retries = []
+        result = self.converter.convert(job, on_retry=retries.append)
+        self.assertEqual(result.status, 'ok', result.message)
+        self.assertEqual([a.settings['effort'] for a in result.attempts], [9, 8])
+        self.assertEqual(len(self.history(job)), 2)
+        self.assertEqual(result.effective_settings['mode'], 'lossy-jxl')
+        self.assertEqual(result.effective_settings['effort'], 8)
+        self.assertEqual(result.effective_settings['distance'], 0.2)
+        self.assertIn('effort 9→8', result.message)
+        self.assertEqual([r['settings']['effort'] for r in retries], [8])
+
     def test_retry_is_opt_out_and_does_not_repeat_effort7(self):
         for effort, enabled in ((9, False), (7, True), (5, True)):
             with self.subTest(effort=effort, enabled=enabled):
@@ -274,11 +293,12 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
                 self.assertEqual(len(self.history(job)), 1)
                 self.assertFalse(job.destination.exists())
 
-    def test_matching_assert_stops_after_one_effort_retry(self):
+    def test_matching_assert_stops_at_effort7(self):
         job = self.jobs(['alwaysassert.NEF'], Settings(effort=9))[0]
         result = self.converter.convert(job)
         self.assertEqual(result.status, 'error')
-        self.assertEqual(len(self.history(job)), 2)
+        self.assertEqual(len(self.history(job)), 3)
+        self.assertEqual([a.settings['effort'] for a in result.attempts], [9, 8, 7])
         self.assertIsNone(result.effective_settings)
         self.assertFalse(job.destination.exists())
         self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
@@ -297,7 +317,8 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         source = job.source.path.read_bytes()
         result = self.converter.convert(job)
         self.assertEqual(result.status, 'ok', result.message)
-        self.assertEqual([a.settings['mode'] for a in result.attempts], ['lossy-jxl', 'lossy-jxl', 'lossless-jpeg'])
+        self.assertEqual([a.settings['mode'] for a in result.attempts], ['lossy-jxl'] * 3 + ['lossless-jpeg'])
+        self.assertEqual([a.settings['adobe_jxl_effort'] for a in result.attempts], [9, 8, 7, None])
         self.assertEqual(result.dng['compression'], 7)
         self.assertEqual(result.dng['width'] * result.dng['height'], 42000000)
         self.assertEqual(result.effective_settings['mode'], 'lossless-jpeg')
@@ -320,7 +341,7 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         job = self.jobs(['missingafterassert.NEF'], Settings(effort=9))[0]
         result = self.converter.convert(job)
         self.assertEqual(result.status, 'error')
-        self.assertEqual(len(self.history(job)), 2)
+        self.assertEqual(len(self.history(job)), 3)
         self.assertIn('DNGを生成しませんでした', result.message)
         self.assertFalse(job.destination.exists())
 
@@ -329,6 +350,8 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         result = self.converter.convert(job)
         self.assertEqual(result.status, 'error')
         self.assertEqual(len(self.history(job)), 2)
+        self.assertEqual([a.settings['effort'] for a in result.attempts], [9, 8])
+        self.assertIn('unsupported RAW', result.message)
         self.assertFalse(job.destination.exists())
 
     def test_changed_source_is_rejected_before_retry_process(self):
@@ -352,18 +375,18 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
     def test_cancel_during_retry_terminates_process_and_preserves_pending_jobs(self):
         jobs = self.jobs(['retryhang.NEF', 'pending.NEF'], Settings(effort=9))
         cancel = threading.Event()
-        def stop_second_process():
+        def stop_hanging_retry():
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 try:
-                    if len(self.history(jobs[0])) >= 2:
+                    if len(self.history(jobs[0])) >= 3:
                         break
                 except (OSError, ValueError):
                     pass
                 if cancel.wait(0.02):
                     return
             cancel.set()
-        stopper = threading.Thread(target=stop_second_process, daemon=True)
+        stopper = threading.Thread(target=stop_hanging_retry, daemon=True)
         stopper.start()
         try:
             results, report = run_batch(self.converter, jobs, self.output, cancel)
@@ -371,7 +394,7 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
             cancel.set()
             stopper.join(timeout=2)
         self.assertEqual([r.status for r in results], ['cancelled'])
-        self.assertEqual(len(self.history(jobs[0])), 2)
+        self.assertEqual(len(self.history(jobs[0])), 3)
         self.assertFalse(any(job.destination.exists() for job in jobs))
         self.assertEqual(json.loads(report.read_text(encoding='utf-8').splitlines()[-1])['pending'], 1)
         self.assertEqual(list(self.output.glob('.raw-to-dng-*')), [])
@@ -382,15 +405,16 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         results, report = run_batch(self.converter, jobs, self.output, on_event=lambda kind, data: events.append((kind, data)))
         self.assertEqual([r.status for r in results], ['ok', 'ok'])
         retries = [data for kind, data in events if kind == 'retry']
-        self.assertEqual(len(retries), 1)
-        self.assertEqual(retries[0]['index'], 0)
-        self.assertEqual(retries[0]['settings']['effort'], 7)
+        self.assertEqual([r['index'] for r in retries], [0, 0])
+        self.assertEqual([r['settings']['effort'] for r in retries], [8, 7])
+        self.assertEqual([r['attempt'] for r in retries], [2, 3])
+        self.assertEqual([r['message'] for r in retries], ['effort 9→8で再試行', 'effort 8→7で再試行'])
         records = [json.loads(line) for line in report.read_text(encoding='utf-8').splitlines()]
         first = records[1]
         self.assertEqual(first['settings']['effort'], 9)
         self.assertEqual(first['requested_settings']['effort'], 9)
         self.assertEqual(first['effective_settings']['effort'], 7)
-        self.assertEqual(len(first['attempts']), 2)
+        self.assertEqual(len(first['attempts']), 3)
         self.assertEqual(records[-1]['ok'], 2)
 
     def test_42mp_to_24mp_pipeline_and_raw_metadata(self):

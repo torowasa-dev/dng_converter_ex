@@ -1,9 +1,9 @@
 {
-  "created_utc": "2026-10-05T03:11:05.318305+00:00",
+  "created_utc": "2026-10-05T04:26:13.124687+00:00",
   "project_name": "DngConverterEx",
-  "app_version": "1.2.0",
+  "app_version": "1.2.1",
   "automated_tests": {
-    "passed": 32,
+    "passed": 33,
     "failed": 0,
     "command": "python3 -m unittest discover -s tests -v",
     "python": "3.12.14"
@@ -27,7 +27,7 @@
       "lossless JXL effort disabled",
       "preferences save and restore",
       "controls disabled while busy",
-      "retry progress",
+      "stepwise retry progress",
       "retry completion",
       "progress bar visible"
     ],
@@ -68,7 +68,7 @@
         ]
       }
     ],
-    "visual_review": "Japanese text and visible controls reviewed on all five captured screens."
+    "visual_review": "Japanese text and controls reviewed on the two updated screenshots (advanced and recovery guide). The other three screenshots are byte-for-byte unchanged from 1.2.0."
   },
   "documentation": {
     "relative_links": "pass",
@@ -76,7 +76,7 @@
     "python_310_syntax": "pass",
     "version_consistency": "pass"
   },
-  "tested": "Synthetic DNG metadata and real simulated processes: targeted assertion retry, fresh staging, opt-in fallback, unchanged quality/resolution, shared timeout, cancellation, source protection, per-attempt settings/logs, CLI options; actual Tkinter controls, saved preferences, guide navigation and retry progress on Linux.",
+  "tested": "Synthetic DNG metadata and real simulated processes: stepwise targeted-assert retries (9 to 8 to 7 and 8 to 7), stop on effort 8 success, bounded opt-in fallback, unchanged quality/resolution, fresh staging, shared timeout, cancellation, source protection, per-attempt settings/logs, CLI options; actual Tkinter controls, saved preferences, guide navigation and stepwise retry progress on Linux.",
   "not_tested": [
     "Actual Adobe DNG Converter",
     "Workaround on the reported RAW file",

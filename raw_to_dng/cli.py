@@ -25,7 +25,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=[mode.value for mode in Mode], default=Mode.LOSSY_JXL.value)
     parser.add_argument("--distance", type=float, default=0.1, help="JPEG XL画質: 0〜6、小さいほど高画質")
     parser.add_argument("--effort", type=int, default=7)
-    parser.add_argument("--no-jxl-retry", action="store_true", help="該当assert時のeffort 8/9→7再試行を無効化")
+    parser.add_argument("--no-jxl-retry", action="store_true", help="該当assert時のeffort段階再試行（9→8→7）を無効化")
     parser.add_argument("--jxl-fallback", action="store_true", help="該当assert時にロスレスJPEGへ変更（原寸指定時のみ）")
     resolution = parser.add_mutually_exclusive_group()
     resolution.add_argument("--megapixels", "--mp", type=float, help="上限MP。24は2400万画素")
