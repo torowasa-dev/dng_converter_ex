@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import heapq
 import math
 from typing import Iterable
 
@@ -28,29 +29,37 @@ class BatchProgress:
     _finished: set[int] = field(default_factory=set)
     _seconds: float = 0.0
     _samples: int = 0
-    _active: int | None = None
-    _started: float = 0.0
+    _active: dict[int, float] = field(default_factory=dict)
+    _parallel_jobs: int = 1
+
+    @property
+    def completed(self) -> int:
+        return len(self._finished)
 
     @property
     def remaining(self) -> int:
         return self.total - len(self._finished)
 
-    def plan(self, work: Iterable[bool]) -> None:
+    def plan(self, work: Iterable[bool], parallel_jobs: int = 1) -> None:
+        if type(parallel_jobs) is not int or parallel_jobs < 1:
+            raise ValueError("並列実行数は1以上です。")
         flags = tuple(work)
         self.total, self.planned, self.stopped = len(flags), True, False
         self._pending_work = {i for i, needs_conversion in enumerate(flags) if needs_conversion}
         self._finished.clear()
-        self._seconds, self._samples, self._active = 0.0, 0, None
+        self._seconds, self._samples, self._parallel_jobs = 0.0, 0, parallel_jobs
+        self._active.clear()
 
     def start(self, index: int, now: float) -> None:
-        self._active, self._started = index, now
+        if 0 <= index < self.total and index not in self._finished:
+            self._active.setdefault(index, now)
 
     def result(self, index: int, status: str, elapsed: float, attempted: bool) -> None:
         if not 0 <= index < self.total or index in self._finished:
             return
         self._finished.add(index)
         self._pending_work.discard(index)
-        self._active = None
+        self._active.pop(index, None)
         if attempted and status not in ("skipped", "cancelled") and elapsed > 0 and math.isfinite(elapsed):
             self._seconds += elapsed
             self._samples += 1
@@ -63,8 +72,15 @@ class BatchProgress:
         if not self._samples:
             return None
         average = self._seconds / self._samples
-        active_time = max(0, now - self._started) if self._active in self._pending_work else 0
-        return max(1.0, average * len(self._pending_work) - active_time)
+        # Estimate when all worker slots become free, including the final
+        # partial wave. Out-of-order completion must not reset other timers.
+        active = [max(1.0, average - max(0, now - started))
+                  for index, started in self._active.items() if index in self._pending_work]
+        slots = active + [0.0] * max(0, min(self._parallel_jobs, len(self._pending_work)) - len(active))
+        heapq.heapify(slots)
+        for _ in range(len(self._pending_work) - len(active)):
+            heapq.heapreplace(slots, slots[0] + average)
+        return max(1.0, max(slots))
 
     def summary(self, now: float) -> str:
         if not self.planned:

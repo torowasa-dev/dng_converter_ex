@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import psutil
 
-from raw_to_dng.resources import ProcessControl
+from raw_to_dng.resources import CpuBudget, ProcessControl
 
 
 class FakeProcess:
@@ -124,6 +124,33 @@ class ResourceTests(unittest.TestCase):
         child.is_running = lambda: False
         root.descendants = []
         self.assertEqual(control._snapshot()[1], 2)
+
+    def test_parallel_controls_share_and_reclaim_the_total_cpu_budget(self):
+        clock, budget = FakeClock(), CpuBudget()
+        first = self.control(FakeProcess(1), clock, limit=1, cpus=4)
+        second = self.control(FakeProcess(2), clock, limit=1, cpus=4)
+        first._budget = second._budget = budget
+        with patch('raw_to_dng.resources.time.monotonic', clock):
+            with first:
+                self.assertAlmostEqual(first.rate, 0.04)
+                with second:
+                    first.update(FakeEvent(clock), lambda: None)
+                    self.assertAlmostEqual(first.rate + second.rate, 0.04)
+                    self.assertAlmostEqual(second.rate, 0.02)
+                    # Throttle cleanup does not release a live worker's share.
+                    second.close()
+                    self.assertEqual(budget.share(), 0.5)
+                first.update(FakeEvent(clock), lambda: None)
+                self.assertAlmostEqual(first.rate, 0.04)
+        self.assertEqual(budget.share(), 1)
+
+    def test_failed_attempt_returns_its_cpu_share(self):
+        control = self.control(FakeProcess(1), FakeClock())
+        budget = control._budget = CpuBudget()
+        with self.assertRaises(RuntimeError):
+            with control:
+                raise RuntimeError('failed converter')
+        self.assertEqual(budget.share(), 1)
 
     def test_real_child_priority_and_cpu_usage_are_regulated(self):
         if sys.platform.startswith('linux') and int(os.readlink('/proc/self')) != os.getpid():

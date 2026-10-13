@@ -6,6 +6,7 @@ import json
 import math
 import os
 import plistlib
+import queue
 import re
 import shutil
 import string
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -21,13 +23,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
-from .resources import PRIORITY_LABELS, ProcessControl
+from .resources import PRIORITY_LABELS, CpuBudget, ProcessControl
 from .dng import DngError, DngInfo, inspect_dng
 
 
-RAW_EXTENSIONS = frozenset(".3fr .arw .bay .cap .cr2 .cr3 .crw .dcs .dcr .drf .eip .erf .fff .iiq .k25 .kdc .mdc .mef .mos .mrw .nef .nrw .obm .orf .pef .ptx .pxn .r3d .raf .raw .rw2 .rwl .sr2 .srf .srw .sti .x3f".split())
+RAW_EXTENSIONS = frozenset(".3fr .arw .bay .cap .cr2 .cr3 .crw .dcs .dcr .drf .eip .erf .fff .iiq .k25 .kdc .mdc .mef .mos .mrw .nef .nrw .obm .orf .pef .ptx .pxn .r3d .raf .raw .rw2 .rwl .sr2 .srf .srw .sti .tif .tiff .x3f".split())
 ADOBE_DOWNLOAD_URL = "https://helpx.adobe.com/camera-raw/desktop/dng-and-file-formats/adobe-dng-converter.html"
 COMPATIBILITIES = ("2.4", "4.1", "4.6", "5.4", "6.6", "7.1", "11.2", "12.4", "13.2", "14.0", "15.3")
+MAX_PARALLEL_JOBS = 32
 
 
 class ConversionError(RuntimeError):
@@ -90,6 +93,8 @@ class Settings:
     jxl_fallback: bool = False
     priority: str = "normal"
     cpu_limit: int = 100
+    parallel_jobs: int = 1
+    delete_source: bool = False
 
     @property
     def pixel_limit(self) -> int | None:
@@ -102,6 +107,10 @@ class Settings:
             raise ValueError("プロセス優先度が不正です。")
         if type(self.cpu_limit) is not int or not 1 <= self.cpu_limit <= 100:
             raise ValueError("CPU使用率の上限は1〜100%です。")
+        if type(self.parallel_jobs) is not int or not 1 <= self.parallel_jobs <= MAX_PARALLEL_JOBS:
+            raise ValueError(f"並列実行数は1〜{MAX_PARALLEL_JOBS}です。")
+        if type(self.delete_source) is not bool:
+            raise ValueError("成功した元ファイルの削除はON/OFFで指定してください。")
         if not math.isfinite(self.distance) or not 0 <= self.distance <= 6:
             raise ValueError("JPEG XL distanceは0〜6です。小さいほど高画質です。")
         if not isinstance(self.effort, int) or not 1 <= self.effort <= 9:
@@ -262,8 +271,8 @@ def scan_inputs(inputs: Iterable[str | Path], recursive: bool = True, include_dn
             break
         root = Path(value).expanduser().resolve()
         if root.is_file():
-            if root.suffix.lower() not in RAW_EXTENSIONS | {".dng"}:
-                raise ValueError(f"RAW/DNG以外のファイルです: {root.name}")
+            # Explicitly chosen inputs may be TIFF RAW or have any extension.
+            # Adobe and the output validator determine whether conversion works.
             if root not in seen:
                 sources.append(Source(root))
                 seen.add(root)
@@ -376,12 +385,16 @@ def _publish_without_overwrite(stage: Path, target: Path) -> None:
         stage.unlink()
 
 
-def publish(stage: Path, target: Path, policy: str) -> Path | None:
+def publish(stage: Path, target: Path, policy: str, *, reserved: frozenset[str] = frozenset()) -> Path | None:
     if policy == "overwrite":
         os.replace(stage, target)
         return target
     candidate, index = target, 1
     while True:
+        if candidate != target and str(candidate).casefold() in reserved:
+            candidate = target.with_name(f"{target.stem}_{index:03d}{target.suffix}")
+            index += 1
+            continue
         try:
             _publish_without_overwrite(stage, candidate)
             return candidate
@@ -419,11 +432,38 @@ class Result:
     requested_settings: dict[str, Any] | None = None
     effective_settings: dict[str, Any] | None = None
     attempts: list[Attempt] = field(default_factory=list)
+    source_delete_status: str = "disabled"
+    source_delete_message: str = ""
+    _source_identity: tuple[int, int, int, int] | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
+        result.pop("_source_identity")
         result["size_ratio"] = self.output_bytes / self.source_bytes if self.source_bytes else None
         return result
+
+
+def _source_identity(stat: os.stat_result) -> tuple[int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _delete_source(results: list[Result]) -> None:
+    """Remove a source only while it still matches every verified conversion."""
+    source = Path(results[0].source)
+    try:
+        current = _source_identity(source.stat())
+        for result in results:
+            if result.status != "ok" or result._source_identity != current:
+                raise ConversionError("変換後に元ファイルが変更されたため保持しました。")
+            if not result.dng or not result.output_bytes or Path(result.destination).stat().st_size != result.output_bytes:
+                raise ConversionError("成功した出力DNGを確認できないため元ファイルを保持しました。")
+        source.unlink()
+        status, message = "deleted", "元ファイルを削除しました。"
+    except Exception as exc:
+        status, message = "error", f"元ファイルを削除できませんでした: {exc}"
+    for result in results:
+        result.source_delete_status, result.source_delete_message = status, message
+        result.message += " / " + message
 
 
 class Converter:
@@ -452,12 +492,13 @@ class Converter:
     @staticmethod
     def _check_source(job: Job, source_stat: os.stat_result) -> None:
         current = job.source.path.stat()
-        if (source_stat.st_size, source_stat.st_mtime_ns) != (current.st_size, current.st_mtime_ns):
+        if _source_identity(source_stat) != _source_identity(current):
             raise ConversionError("変換中に入力ファイルが変更されたため、出力を採用しません。")
 
     def _attempt(self, job: Job, settings: Settings, cancel: threading.Event,
                  started: float, source_stat: os.stat_result, result: Result,
-                 reason: str) -> None:
+                 reason: str, cpu_budget: CpuBudget | None = None,
+                 reserved: frozenset[str] = frozenset()) -> None:
         attempt_started = time.monotonic()
         attempt = Attempt(len(result.attempts) + 1, reason, settings.to_dict())
         result.attempts.append(attempt)
@@ -479,7 +520,7 @@ class Converter:
                     try:
                         process = subprocess.Popen(attempt.command, stdout=log, stderr=subprocess.STDOUT,
                                                    stdin=subprocess.DEVNULL, shell=False, **kwargs)
-                        with ProcessControl(process.pid, settings.priority, settings.cpu_limit) as control:
+                        with ProcessControl(process.pid, settings.priority, settings.cpu_limit, budget=cpu_budget) as control:
                             if (settings.priority != "normal" or settings.cpu_limit < 100) and not control.enabled and process.poll() is None:
                                 raise ConversionError("変換プロセスのCPU・優先度を制御できませんでした。")
                             while process.poll() is None:
@@ -508,7 +549,7 @@ class Converter:
                     os.utime(stage, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
                 self._check_running(cancel, started, job.settings.timeout_seconds)
                 self._check_source(job, source_stat)
-                final = publish(stage, job.destination, settings.collision)
+                final = publish(stage, job.destination, settings.collision, reserved=reserved)
                 if final is None:
                     result.status, result.message = "skipped", "変換中に同名出力が作成されたためスキップ。"
                 else:
@@ -534,10 +575,14 @@ class Converter:
             attempt.elapsed_seconds = round(time.monotonic() - attempt_started, 3)
 
     def convert(self, job: Job, cancel: threading.Event | None = None,
-                on_retry: Callable[[dict[str, Any]], None] | None = None) -> Result:
+                on_retry: Callable[[dict[str, Any]], None] | None = None, *,
+                cpu_budget: CpuBudget | None = None,
+                reserved: frozenset[str] = frozenset(), defer_source_delete: bool = False) -> Result:
         cancel = cancel or threading.Event()
         started = time.monotonic()
         result = Result(str(job.source.path), str(job.destination), "error")
+        if job.settings.delete_source:
+            result.source_delete_status = "kept"
         result.requested_settings = job.settings.to_dict()
         try:
             settings = job.settings
@@ -545,6 +590,7 @@ class Converter:
             if cancel.is_set():
                 raise Cancelled("中止しました。")
             source_stat = job.source.path.stat()
+            result._source_identity = _source_identity(source_stat)
             result.source_bytes = source_stat.st_size
             if self.version and settings.mode in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL):
                 if int(self.version.split(".")[0]) < 16:
@@ -560,7 +606,7 @@ class Converter:
             # Effort 5 remains a manual experiment, not a verified workaround.
             for _ in range(4):
                 try:
-                    self._attempt(job, settings, cancel, started, source_stat, result, reason)
+                    self._attempt(job, settings, cancel, started, source_stat, result, reason, cpu_budget, reserved)
                     break
                 except AdobeProcessError as exc:
                     if settings.mode not in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL) or not is_jxl_histogram_assert(exc.output):
@@ -577,6 +623,11 @@ class Converter:
                     if on_retry:
                         on_retry({"attempt": len(result.attempts) + 1, "message": reason,
                                   "settings": settings.to_dict()})
+            if result.status == "ok" and settings.delete_source:
+                if defer_source_delete:
+                    result.source_delete_status = "pending"
+                else:
+                    _delete_source([result])
         except Cancelled as exc:
             result.status, result.message = "cancelled", str(exc)
         except Exception as exc:
@@ -598,30 +649,105 @@ def run_batch(converter: Converter, jobs: list[Job], report_directory: str | Pat
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = directory / f"conversion_report_{stamp}_{uuid.uuid4().hex[:6]}.jsonl"
-    results: list[Result] = []
+    parallel_jobs = jobs[0].settings.parallel_jobs if jobs else 1
+    if type(parallel_jobs) is not int or not 1 <= parallel_jobs <= MAX_PARALLEL_JOBS:
+        raise ValueError(f"並列実行数は1〜{MAX_PARALLEL_JOBS}です。")
+    workers = min(parallel_jobs, len(jobs)) if jobs else 1
+    cpu_budget = CpuBudget()
+    reserved = frozenset(str(job.destination).casefold() for job in jobs)
+    source_jobs: dict[Path, list[int]] = {}
+    for index, job in enumerate(jobs):
+        source_jobs.setdefault(job.source.path.resolve(), []).append(index)
+    results_by_index: dict[int, Result] = {}
+    retries: queue.Queue = queue.Queue()
+
+    def convert(index: int) -> Result:
+        job = jobs[index]
+        started = time.monotonic()
+        try:
+            return converter.convert(job, cancel, on_retry=lambda data: retries.put(
+                {"index": index, "source": str(job.source.path), **data}), cpu_budget=cpu_budget,
+                reserved=reserved, defer_source_delete=True)
+        except Exception as exc:
+            # Unexpected per-file failures must not abandon the other workers.
+            return Result(str(job.source.path), str(job.destination), "error", str(exc),
+                          elapsed_seconds=round(time.monotonic() - started, 3),
+                          requested_settings=job.settings.to_dict())
+
+    def drain_retries() -> None:
+        while True:
+            try:
+                data = retries.get_nowait()
+            except queue.Empty:
+                return
+            event("retry", data)
+
     with report_path.open("x", encoding="utf-8") as report:
         def record(value: dict[str, Any]) -> None:
             report.write(json.dumps(value, ensure_ascii=False) + "\n")
             report.flush()
         record({"type": "batch", "app": f"DngConverterEx {__version__}", "created": datetime.now().astimezone().isoformat(),
                 "converter": str(converter.executable), "converter_version": converter.version,
-                "jobs": len(jobs), "validation": "metadata/structure only; Lightroom and quality distance not independently verified"})
-        for index, job in enumerate(jobs):
-            if cancel.is_set():
-                break
-            event("start", {"index": index, "source": str(job.source.path)})
-            result = converter.convert(job, cancel, on_retry=lambda data: event(
-                "retry", {"index": index, "source": str(job.source.path), **data}))
-            results.append(result)
-            data = {"type": "result", "index": index, "settings": job.settings.to_dict(), **result.to_dict()}
-            record(data)
-            event("result", data)
-            if result.status == "cancelled":
-                break
+                "jobs": len(jobs), "parallel_jobs": parallel_jobs,
+                "validation": "metadata/structure only; Lightroom and quality distance not independently verified"})
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dng-converter") as executor:
+            running = {}
+            next_index = 0
+            try:
+                while running or next_index < len(jobs) and not cancel.is_set():
+                    while len(running) < workers and next_index < len(jobs) and not cancel.is_set():
+                        index = next_index
+                        next_index += 1
+                        event("start", {"index": index, "source": str(jobs[index].source.path)})
+                        running[executor.submit(convert, index)] = index
+                    done, _pending = wait(running, timeout=0.05, return_when=FIRST_COMPLETED)
+                    drain_retries()
+                    for future in done:
+                        index = running.pop(future)
+                        result = future.result()
+                        results_by_index[index] = result
+                        if result.status == "cancelled":
+                            cancel.set()
+                        data = {"type": "result", "index": index, "settings": jobs[index].settings.to_dict(), **result.to_dict()}
+                        record(data)
+                        event("result", data)
+            except BaseException:
+                cancel.set()
+                raise
+        results = [results_by_index[index] for index in sorted(results_by_index)]
+        deleted_sources = deletion_errors = 0
+        # Wait until all conversions stop: quality comparisons can reuse one
+        # input, and pending/skipped/failed outputs must keep that input intact.
+        for indices in source_jobs.values():
+            completed_indices = [index for index in indices if index in results_by_index]
+            group = [results_by_index[index] for index in completed_indices]
+            requested = [results_by_index[index] for index in completed_indices if jobs[index].settings.delete_source]
+            if not requested:
+                continue
+            if (not cancel.is_set() and len(group) == len(indices)
+                    and all(jobs[index].settings.delete_source for index in indices)
+                    and all(result.status == "ok" for result in group)):
+                _delete_source(group)
+                deleted_sources += group[0].source_delete_status == "deleted"
+                deletion_errors += group[0].source_delete_status == "error"
+            else:
+                for result in requested:
+                    result.source_delete_status = "kept"
+                    result.source_delete_message = ("中止したため元ファイルを保持しました。" if cancel.is_set()
+                                                    else "同じ元ファイルの出力に未成功・未処理・削除OFFがあるため保持しました。")
+                    result.message += " / " + result.source_delete_message
+            for index in indices:
+                if index in results_by_index and jobs[index].settings.delete_source:
+                    data = {"type": "source_delete", "index": index,
+                            "settings": jobs[index].settings.to_dict(), **results_by_index[index].to_dict()}
+                    record(data)
+                    event("source_delete", data)
         summary = {"type": "summary", "completed": len(results), "pending": len(jobs) - len(results),
                    "ok": sum(r.status == "ok" for r in results),
                    "errors": sum(r.status == "error" for r in results),
                    "skipped": sum(r.status == "skipped" for r in results), "cancelled": cancel.is_set(),
+                   "delete_source_requested": any(job.settings.delete_source for job in jobs),
+                   "source_deleted": deleted_sources, "source_delete_errors": deletion_errors,
                    "report": str(report_path)}
         record(summary)
         event("done", summary)

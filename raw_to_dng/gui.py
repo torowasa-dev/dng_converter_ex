@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__
 from .core import (
-    ADOBE_DOWNLOAD_URL, COMPATIBILITIES, MODE_LABELS, RAW_EXTENSIONS,
+    ADOBE_DOWNLOAD_URL, COMPATIBILITIES, MAX_PARALLEL_JOBS, MODE_LABELS,
     Converter, Mode, Settings, plan_jobs, resolve_converter, run_batch, scan_inputs,
 )
 from .guide import QualityGuide
@@ -91,6 +91,8 @@ class Application:
         self.skip_existing = tk.BooleanVar(value=False)
         self.priority = tk.StringVar(value=PRIORITY_LABELS["normal"])
         self.cpu_limit = tk.StringVar(value="100")
+        self.parallel_jobs = tk.StringVar(value="1")
+        self.delete_source = tk.BooleanVar(value=False)
         self.jxl_retry = tk.BooleanVar(value=True)
         self.jxl_fallback = tk.BooleanVar(value=False)
         self.hint = tk.StringVar()
@@ -224,10 +226,20 @@ class Application:
         ttk.Label(output, text="出力先").pack(side="left")
         self._entry(output, self.output).pack(side="left", fill="x", expand=True, padx=8)
         self._button(output, "フォルダー選択", self._choose_output).pack(side="left")
-        self.skip_existing_widget = self._check(main, "出力先に同名ファイルがあればスキップ", self.skip_existing)
+        execution = ttk.Frame(main)
+        execution.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.skip_existing_widget = self._check(execution, "出力先に同名ファイルがあればスキップ", self.skip_existing)
         self.skip_existing_widget.configure(command=self._settings_changed)
-        self.skip_existing_widget.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(main, textvariable=self.hint, wraplength=1020, style="Muted.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.skip_existing_widget.pack(side="left")
+        ttk.Label(execution, text="並列実行数").pack(side="left", padx=(24, 8))
+        self.parallel_jobs_widget = ttk.Spinbox(execution, from_=1, to=MAX_PARALLEL_JOBS,
+                                               textvariable=self.parallel_jobs, width=5)
+        self.widgets_to_disable.append(self.parallel_jobs_widget)
+        self.parallel_jobs_widget.pack(side="left")
+        ttk.Label(execution, text="（1＝順次、上限32）", style="Muted.TLabel").pack(side="left", padx=8)
+        self.delete_source_widget = self._check(main, "変換が成功した元ファイルを削除（スキップ・失敗したファイルは残す）", self.delete_source)
+        self.delete_source_widget.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(main, textvariable=self.hint, wraplength=1020, style="Muted.TLabel").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         advanced.columnconfigure(1, weight=1)
         rows = (("JPEGプレビュー", self.preview, ("なし", "中サイズ", "全画素")),
@@ -268,7 +280,7 @@ class Application:
         self.widgets_to_disable.append(self.cpu_limit_widget)
         self.cpu_limit_widget.pack(side="left", padx=(8, 4))
         ttk.Label(resources, text="%").pack(side="left")
-        ttk.Label(resources, text="100%＝制限なし。PC全体のCPU比。", style="Muted.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(resources, text="並列処理全体の上限。100%＝制限なし。", style="Muted.TLabel").pack(side="left", padx=(16, 0))
 
         recovery = ttk.LabelFrame(advanced, text="JPEG XLのエラー対策", padding=8)
         recovery.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -330,10 +342,7 @@ class Application:
     def _choose_files(self) -> None:
         # Case-insensitive wildcard behavior differs between Tk/platforms; include all.
         paths = filedialog.askopenfilenames(title="RAW / DNGを追加", filetypes=(("すべてのファイル", "*"),))
-        invalid = [Path(p).name for p in paths if Path(p).suffix.lower() not in RAW_EXTENSIONS | {".dng"}]
-        if invalid:
-            messagebox.showerror("RAW/DNGを選択", "対象外: " + ", ".join(invalid), parent=self.root)
-        self._add_paths([p for p in paths if Path(p).suffix.lower() in RAW_EXTENSIONS | {".dng"}])
+        self._add_paths(paths)
 
     def _choose_folder(self) -> None:
         path = filedialog.askdirectory(title="RAWが入ったフォルダー")
@@ -404,7 +413,7 @@ class Application:
         if mode in (Mode.LOSSY_JXL, Mode.LOSSY_JPEG):
             self.hint.set("Linear DNGを出力します。縮小と非可逆圧縮は元に戻せません。Kelvin編集用のRAW/WBタグを検査します。JPEG XLはLightroom Classic 13 / Camera Raw 16以降を対象とします。")
         else:
-            self.hint.set("原寸のRAW情報を優先するモードです。縮小する場合は画質指定JPEG XLを選択してください。入力RAWは削除しません。")
+            self.hint.set("原寸のRAW情報を優先するモードです。縮小する場合は画質指定JPEG XLを選択してください。")
             if mode == Mode.LOSSLESS_JXL:
                 self.hint.set(self.hint.get() + " このモードではGUIのeffort指定は適用されません。")
 
@@ -425,7 +434,8 @@ class Application:
             strict_wb=self.strict_wb.get(), preserve_mtime=self.preserve_mtime.get(),
             jxl_retry=self.jxl_retry.get(), jxl_fallback=self.jxl_fallback.get(),
             priority=next(key for key, label in PRIORITY_LABELS.items() if label == self.priority.get()),
-            cpu_limit=int(self.cpu_limit.get()),
+            cpu_limit=int(self.cpu_limit.get()), parallel_jobs=int(self.parallel_jobs.get()),
+            delete_source=self.delete_source.get(),
         )
         settings.validate()
         return settings
@@ -501,7 +511,7 @@ class Application:
                             folder = output / ("quality_d" + tag)
                             jobs.extend(plan_jobs(sources, folder, replace(settings, distance=distance), False, start_index))
                     work = [not (job.settings.collision == "skip" and job.destination.exists()) for job in jobs]
-                    self.events.put(("planned", {"jobs": jobs, "work": work}))
+                    self.events.put(("planned", {"jobs": jobs, "work": work, "parallel_jobs": settings.parallel_jobs}))
                     run_batch(converter, jobs, output, self.cancel,
                               lambda kind, data: self.events.put((kind, data)))
                 except Exception as exc:
@@ -516,7 +526,7 @@ class Application:
             while True:
                 kind, data = self.events.get_nowait()
                 if kind == "planned":
-                    self.batch_progress.plan(data["work"])
+                    self.batch_progress.plan(data["work"], data["parallel_jobs"])
                     self.progress.stop()
                     self.progress.configure(mode="determinate", maximum=len(data["jobs"]), value=0)
                     for index, job in enumerate(data["jobs"]):
@@ -531,7 +541,7 @@ class Application:
                     self.result_tree.set(iid, "state", "再試行中")
                     self.result_tree.set(iid, "message", data["message"])
                     self.status.set("再試行中: " + Path(data["source"]).name + " / " + data["message"])
-                elif kind == "result":
+                elif kind in ("result", "source_delete"):
                     self.batch_progress.result(data["index"], data["status"],
                                                data.get("elapsed_seconds", 0), bool(data.get("attempts")))
                     iid = str(data["index"])
@@ -544,7 +554,9 @@ class Application:
                         state = "完了（再試行）"
                     self.result_tree.item(iid, values=(Path(data["source"]).name, state, dims, size, ratio, data["message"].replace("\n", " ")))
                     self.result_details[iid] = data
-                    self.progress.configure(value=data["index"] + 1)
+                    self.progress.configure(value=self.batch_progress.completed)
+                    if kind == "source_delete":
+                        self.status.set(Path(data["source"]).name + ": " + data["source_delete_message"])
                 elif kind == "done":
                     self.batch_progress.stopped = data["cancelled"]
                     self.last_report = Path(data["report"])
@@ -553,6 +565,8 @@ class Application:
                         if self.result_tree.set(iid, "state") == "待機":
                             self.result_tree.set(iid, "state", "未処理")
                     self.status.set(f"完了 {data['ok']} / エラー {data['errors']} / スキップ {data['skipped']} / 未処理 {data['pending']}。詳細レポート: {self.last_report.name}")
+                    if data.get("delete_source_requested"):
+                        self.status.set(self.status.get() + f" / 元ファイル削除 {data['source_deleted']} / 削除失敗 {data['source_delete_errors']}")
                 elif kind in ("fatal", "aborted"):
                     self.batch_progress.stopped = True
                     self.progress.stop()
@@ -631,7 +645,7 @@ class Application:
         return ("converter", "output", "mode", "quality", "distance", "effort", "resize", "megapixels", "long_edge", "preview",
                 "compatibility", "collision", "name_template", "start_index", "timeout", "recursive", "preserve_folders",
                 "include_dng", "fast_load", "embed_original", "linear", "strict_wb", "preserve_mtime",
-                "skip_existing", "jxl_retry", "jxl_fallback", "priority", "cpu_limit")
+                "skip_existing", "jxl_retry", "jxl_fallback", "priority", "cpu_limit", "parallel_jobs", "delete_source")
 
     def _save_settings(self) -> None:
         try:

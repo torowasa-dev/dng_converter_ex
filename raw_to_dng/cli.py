@@ -25,6 +25,8 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=[mode.value for mode in Mode], default=Mode.LOSSY_JXL.value)
     parser.add_argument("--distance", type=float, default=0.1, help="JPEG XL画質: 0〜6、小さいほど高画質")
     parser.add_argument("--effort", type=int, default=7)
+    parser.add_argument("--jobs", "-j", type=int, default=1, help="並列実行数（1〜32、初期値1）")
+    parser.add_argument("--delete-source", action="store_true", help="成功した元ファイルを削除（初期OFF、同じ入力の全出力成功後）")
     parser.add_argument("--priority", choices=("normal", "low", "idle"), default="normal", help="変換プロセスの優先度")
     parser.add_argument("--cpu-limit", type=int, default=100, help="全論理CPUに対する使用率上限の目安（1〜100%%）")
     parser.add_argument("--no-jxl-retry", action="store_true", help="該当assert時のeffort段階再試行（9→8→7）を無効化")
@@ -76,7 +78,8 @@ def _settings(args) -> Settings:
                       name_template=args.name_template, timeout_seconds=args.timeout,
                       strict_wb=not args.allow_missing_wb, preserve_mtime=not args.no_preserve_mtime,
                       jxl_retry=not args.no_jxl_retry, jxl_fallback=args.jxl_fallback,
-                      priority=args.priority, cpu_limit=args.cpu_limit)
+                      priority=args.priority, cpu_limit=args.cpu_limit, parallel_jobs=args.jobs,
+                      delete_source=args.delete_source)
     result.validate()
     return result
 
@@ -138,13 +141,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[{data['status']}] {Path(data['source']).name}: {data['message']}", flush=True)
             elif kind == "retry":
                 print(f"[再試行 {data['attempt']}] {Path(data['source']).name}: {data['message']}", flush=True)
+            elif kind == "source_delete":
+                print(f"[{data['source_delete_status']}] {Path(data['source']).name}: {data['source_delete_message']}", flush=True)
             elif kind == "done":
                 print(f"report: {data['report']}", flush=True)
         try:
             results, _report = run_batch(converter, jobs, output, cancel, event)
         finally:
             signal.signal(signal.SIGINT, previous_handler)
-        return 130 if cancel.is_set() else (1 if any(r.status == "error" for r in results) else 0)
+        return 130 if cancel.is_set() else (1 if any(r.status == "error" or r.source_delete_status == "error" for r in results) else 0)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 2

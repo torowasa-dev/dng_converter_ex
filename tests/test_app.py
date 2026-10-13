@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -34,6 +35,7 @@ class SettingsTests(unittest.TestCase):
                          Settings(distance=float("nan")), Settings(distance=7),
                          Settings(timeout_seconds=0), Settings(effort=0),
                          Settings(priority='unknown'), Settings(cpu_limit=0), Settings(cpu_limit=101), Settings(cpu_limit=True),
+                         Settings(parallel_jobs=0), Settings(parallel_jobs=33), Settings(parallel_jobs=1.5), Settings(parallel_jobs=True), Settings(delete_source=1),
                          Settings(name_template="../{stem}"), Settings(name_template="{stem.__class__}"),
                          Settings(name_template="{index:999999999d}")):
             with self.subTest(settings=settings):
@@ -148,6 +150,13 @@ class PlanningTests(unittest.TestCase):
         jobs = plan_jobs(sources, output, Settings())
         self.assertEqual(jobs[0].destination.parent.name, "写真")
 
+    def test_explicit_files_have_no_extension_restriction_and_folders_include_tiff(self):
+        files = [self.base / name for name in ('photo.TIFF', 'photo.tif', 'photo.custom', 'photo_without_extension')]
+        for path in files:
+            path.write_bytes(b'RAW')
+        self.assertEqual({source.path for source in scan_inputs(files)}, {path.resolve() for path in files})
+        self.assertEqual({source.path for source in scan_inputs([self.base])}, {path.resolve() for path in files[:2]})
+
 
 @unittest.skipIf(os.name == "nt", "The simulated executable uses a POSIX shebang; production Adobe Windows execution is not tested here.")
 class PipelineTests(unittest.TestCase):
@@ -177,6 +186,13 @@ if source.stem.startswith('otherassert'):
     sys.exit(7)
 if source.stem.startswith('warningassert'):
     print(assertion, file=sys.stderr)
+if source.stem.startswith('parallel'):
+    source.with_suffix('.ready').touch()
+    deadline = time.monotonic() + 5
+    while len(list(source.parent.glob('parallel*.ready'))) < 2:
+        if time.monotonic() >= deadline:
+            sys.exit(9)
+        time.sleep(0.01)
 if jxl and source.stem.startswith('retryhang') and effort == 7:
     time.sleep(8)
 should_assert = jxl and (source.stem.startswith('alwaysassert') or
@@ -255,6 +271,133 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         self.assertEqual(records[1]['requested_settings']['collision'], 'skip')
         self.assertEqual(records[-1]['skipped'], 1)
         self.assertEqual(records[-1]['ok'], 1)
+
+    def test_parallel_adobe_processes_run_together_and_keep_separate_outputs(self):
+        jobs = self.jobs(['parallelA.NEF', 'parallelB.NEF'], Settings(parallel_jobs=2, megapixels=24))
+        results, report = run_batch(self.converter, jobs, self.output)
+        self.assertEqual([r.status for r in results], ['ok', 'ok'])
+        histories = [self.history(job)[0] for job in jobs]
+        self.assertEqual(len({history['pid'] for history in histories}), 2)
+        self.assertEqual(len({history['stage'] for history in histories}), 2)
+        self.assertEqual(len({r.destination for r in results}), 2)
+        for job in jobs:
+            self.assertTrue(job.destination.is_file())
+            self.assertEqual(job.source.path.read_bytes(), b'raw source unchanged')
+        self.assertFalse(list(self.output.glob('.raw-to-dng-*')))
+        self.assertEqual(json.loads(report.read_text(encoding='utf-8').splitlines()[-1])['ok'], 2)
+
+    def test_parallel_cancellation_terminates_every_started_adobe_process(self):
+        jobs = self.jobs(['hangA.NEF', 'hangB.NEF', 'pending.NEF'], Settings(parallel_jobs=2, delete_source=True))
+        cancel, observed = threading.Event(), threading.Event()
+        processes = []
+        popen = subprocess.Popen
+        def track_process(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            if len(processes) == 2:
+                observed.set()
+            return process
+        def stop():
+            observed.wait(5)
+            cancel.set()
+        watcher = threading.Thread(target=stop)
+        watcher.start()
+        try:
+            with patch('raw_to_dng.core.subprocess.Popen', side_effect=track_process):
+                results, _report = run_batch(self.converter, jobs, self.output, cancel)
+        finally:
+            cancel.set()
+            observed.set()
+            watcher.join(5)
+        self.assertEqual(len(processes), 2)
+        self.assertTrue(all(process.poll() is not None for process in processes))
+        self.assertEqual([r.status for r in results], ['cancelled', 'cancelled'])
+        self.assertFalse(jobs[2].source.path.with_suffix('.attempts.jsonl').exists())
+        self.assertFalse(list(self.output.glob('.raw-to-dng-*')))
+        self.assertTrue(all(job.source.path.is_file() for job in jobs))
+
+    def test_delete_source_only_removes_verified_success_and_logs_the_result(self):
+        settings = Settings(parallel_jobs=2, delete_source=True, collision='skip')
+        jobs = self.jobs(['good.TIFF', 'corrupt.NEF', 'fail.NEF', 'skipped.NEF', 'missing.NEF'], settings)
+        self.output.mkdir()
+        jobs[3].destination.write_bytes(b'previous output')
+        events = []
+        results, report = run_batch(self.converter, jobs, self.output, on_event=lambda kind, data: events.append((kind, data)))
+        self.assertEqual([r.status for r in results], ['ok', 'error', 'error', 'skipped', 'error'])
+        self.assertFalse(jobs[0].source.path.exists())
+        self.assertTrue(jobs[0].destination.is_file())
+        self.assertTrue(all(job.source.path.is_file() for job in jobs[1:]))
+        self.assertEqual(results[0].source_delete_status, 'deleted')
+        self.assertEqual(results[1].source_delete_status, 'kept')
+        self.assertIn('削除', results[0].message)
+        records = [json.loads(line) for line in report.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(records[-1]['source_deleted'], 1)
+        self.assertEqual(records[-1]['source_delete_errors'], 0)
+        self.assertEqual(len([r for r in records if r['type'] == 'source_delete']), 5)
+        self.assertTrue(any(kind == 'source_delete' and data['index'] == 0 and data['source_delete_status'] == 'deleted'
+                            for kind, data in events))
+
+    def test_direct_conversion_delete_is_opt_in(self):
+        for enabled in (False, True):
+            job = self.jobs([f'direct{enabled}.custom'], Settings(delete_source=enabled))[0]
+            result = self.converter.convert(job)
+            self.assertEqual(result.status, 'ok', result.message)
+            self.assertEqual(job.source.path.exists(), not enabled)
+            self.assertEqual(result.source_delete_status, 'deleted' if enabled else 'disabled')
+
+    def test_parallel_quality_comparison_deletes_source_after_all_outputs_succeed(self):
+        source = self.jobs(['parallelshared.TIFF'])[0].source
+        settings = Settings(parallel_jobs=2, delete_source=True)
+        # The fixture's barrier needs two paths; this marker lets the shared
+        # source proceed while two separate processes read the same input.
+        (self.base / 'parallelother.ready').touch()
+        jobs = [plan_jobs([source], self.output / str(distance), replace(settings, distance=distance))[0]
+                for distance in (0.1, 0.2)]
+        observed_source = []
+        results, report = run_batch(self.converter, jobs, self.output, on_event=lambda kind, _data:
+                                    observed_source.append(source.path.exists()) if kind == 'result' else None)
+        self.assertEqual([r.status for r in results], ['ok', 'ok'])
+        self.assertEqual(observed_source, [True, True])
+        self.assertFalse(source.path.exists())
+        self.assertEqual([r.source_delete_status for r in results], ['deleted', 'deleted'])
+        self.assertEqual(json.loads(report.read_text(encoding='utf-8').splitlines()[-1])['source_deleted'], 1)
+
+    def test_quality_comparison_keeps_source_when_one_output_fails(self):
+        source = self.jobs(['alwaysassertshared.NEF'])[0].source
+        settings = Settings(parallel_jobs=2, delete_source=True)
+        jobs = [plan_jobs([source], self.output / 'jxl', settings)[0],
+                plan_jobs([source], self.output / 'jpeg', replace(settings, mode=Mode.LOSSLESS_JPEG))[0]]
+        results, _report = run_batch(self.converter, jobs, self.output)
+        self.assertEqual([r.status for r in results], ['error', 'ok'])
+        self.assertTrue(source.path.is_file())
+        self.assertEqual([r.source_delete_status for r in results], ['kept', 'kept'])
+
+    def test_modified_source_or_missing_output_prevents_deletion(self):
+        for mutation in ('source', 'output'):
+            job = self.jobs([f'changed{mutation}.NEF'], Settings(delete_source=True))[0]
+            def modify(kind, _data):
+                if kind == 'result':
+                    if mutation == 'source':
+                        job.source.path.write_bytes(b'new original')
+                    else:
+                        job.destination.unlink()
+            results, report = run_batch(self.converter, [job], self.output, on_event=modify)
+            self.assertTrue(job.source.path.is_file())
+            self.assertEqual((results[0].status, results[0].source_delete_status), ('ok', 'error'))
+            self.assertEqual(json.loads(report.read_text(encoding='utf-8').splitlines()[-1])['source_delete_errors'], 1)
+
+    def test_delete_permission_failure_keeps_dng_and_original_and_is_reported(self):
+        job = self.jobs(['deletefailure.NEF'], Settings(delete_source=True))[0]
+        unlink = Path.unlink
+        def refuse_source(path, *args, **kwargs):
+            if path == job.source.path:
+                raise PermissionError('file in use')
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', refuse_source):
+            result = self.converter.convert(job)
+        self.assertEqual((result.status, result.source_delete_status), ('ok', 'error'))
+        self.assertIn('file in use', result.source_delete_message)
+        self.assertTrue(job.source.path.is_file() and job.destination.is_file())
 
     def test_existing_output_is_converted_when_skip_is_disabled(self):
         for collision in ('rename', 'overwrite'):
@@ -339,10 +482,12 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         out = StringIO()
         with patch('sys.stdout', out):
             code = main(['convert', str(source), '--output', str(self.output), '--dry-run',
-                         '--priority', 'idle', '--cpu-limit', '25'])
+                         '--priority', 'idle', '--cpu-limit', '25', '--jobs', '3'])
         self.assertEqual(code, 0)
         data = json.loads(out.getvalue())[0]
         self.assertEqual((data['settings']['priority'], data['settings']['cpu_limit']), ('idle', 25))
+        self.assertEqual(data['settings']['parallel_jobs'], 3)
+        self.assertNotIn('--jobs', data['adobe_flags'])
         self.assertNotIn('--cpu-limit', data['adobe_flags'])
 
     def test_retry_is_opt_out_and_does_not_repeat_effort7(self):

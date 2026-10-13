@@ -80,6 +80,30 @@ class ProgressTests(unittest.TestCase):
             with self.subTest(seconds=seconds):
                 self.assertEqual(format_remaining(seconds), expected)
 
+    def test_parallel_eta_includes_the_final_partial_wave(self):
+        progress = BatchProgress()
+        progress.plan([True] * 6 + [False], parallel_jobs=2)
+        progress.result(0, 'ok', 10, True)
+        # Five remaining conversions take three waves, not 25 seconds.
+        self.assertEqual(progress.estimate(100), 30)
+        progress.result(6, 'skipped', 100, False)
+        self.assertEqual(progress.estimate(100), 30)
+
+    def test_out_of_order_result_preserves_other_running_timers(self):
+        progress = BatchProgress()
+        progress.plan([True] * 4, parallel_jobs=2)
+        progress.start(0, 100)
+        progress.start(1, 100)
+        progress.result(1, 'ok', 10, True)
+        progress.start(2, 110)
+        self.assertEqual((progress.completed, progress.remaining), (1, 3))
+        self.assertEqual(progress.estimate(114), 11)
+        progress.result(1, 'ok', 999, True)
+        self.assertEqual(progress.completed, 1)
+        progress.plan([True], parallel_jobs=1)
+        self.assertEqual(progress.completed, 0)
+        self.assertIsNone(progress.estimate(999))
+
 
 if __name__ == '__main__':
     unittest.main()
