@@ -187,27 +187,55 @@ class ResourceTests(unittest.TestCase):
     def test_real_parallel_processes_respect_a_shared_cpu_ceiling(self):
         if sys.platform.startswith('linux') and int(os.readlink('/proc/self')) != os.getpid():
             self.skipTest('Virtual process IDs differ from procfs; native process control is tested in CI.')
-        processes = []
+        processes, workers, errors = [], [], []
+        cancel, go = threading.Event(), threading.Event()
+        ready = [threading.Event(), threading.Event()]
         try:
             for _ in range(2):
                 processes.append(subprocess.Popen([sys.executable, '-c', 'while True: pass'],
                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             budget = CpuBudget()
+            def monitor(index):
+                try:
+                    with ProcessControl(processes[index].pid, 'normal', 25, cpus=1, budget=budget) as control:
+                        ready[index].set()
+                        go.wait(5)
+                        def check():
+                            if cancel.is_set():
+                                raise InterruptedError('test finished')
+                        # Production monitors each Adobe process on its own
+                        # worker. Serial update calls leave the other process
+                        # unregulated throughout a blocking throttle wait.
+                        while not cancel.wait(0.05):
+                            control.update(cancel, check)
+                except InterruptedError:
+                    if not cancel.is_set():
+                        errors.append('unexpected interrupt')
+                except Exception as exc:
+                    errors.append(exc)
+            workers = [threading.Thread(target=monitor, args=(index,)) for index in range(2)]
+            for worker in workers:
+                worker.start()
+            self.assertTrue(all(event.wait(5) for event in ready), 'monitors did not start')
+            before = [psutil.Process(process.pid).cpu_times() for process in processes]
             started = time.monotonic()
-            with ProcessControl(processes[0].pid, 'normal', 25, cpus=1, budget=budget) as first, \
-                 ProcessControl(processes[1].pid, 'normal', 25, cpus=1, budget=budget) as second:
-                def check():
-                    if time.monotonic() - started > 6:
-                        raise TimeoutError('test deadline')
-                while time.monotonic() - started < 1.2:
-                    time.sleep(0.05)
-                    first.update(threading.Event(), check)
-                    second.update(threading.Event(), check)
-                elapsed = time.monotonic() - started
-                usage = [psutil.Process(process.pid).cpu_times() for process in processes]
-                self.assertLess(sum(cpu.user + cpu.system for cpu in usage) / elapsed, 0.65)
+            go.set()
+            time.sleep(1.2)
+            cancel.set()
+            for worker in workers:
+                worker.join(3)
+            elapsed = time.monotonic() - started
+            usage = [psutil.Process(process.pid).cpu_times() for process in processes]
+            cpu = sum(after.user + after.system - prior.user - prior.system for prior, after in zip(before, usage))
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertLess(cpu / elapsed, 0.65)
             self.assertEqual(budget.active, 0)
         finally:
+            cancel.set()
+            go.set()
+            for worker in workers:
+                worker.join(3)
             for process in processes:
                 process.terminate()
             for process in processes:
