@@ -9,7 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from raw_to_dng.cli import _settings, make_parser
-from raw_to_dng.core import Job, Result, Settings, Source, _delete_source, _source_identity, publish, run_batch
+from raw_to_dng.core import Job, Mode, Result, Settings, Source, _delete_source, _source_identity, publish, run_batch, speed_settings
+from dataclasses import asdict, replace
 
 
 class GatedConverter:
@@ -164,6 +165,43 @@ class BatchTests(unittest.TestCase):
         args.jobs = 0
         with self.assertRaises(ValueError):
             _settings(args)
+
+    def test_speed_preset_preserves_quality_resolution_and_output_options(self):
+        settings = Settings(distance=0.2, effort=9, long_edge=6000, preview=0,
+                            priority='low', cpu_limit=90, parallel_jobs=4, collision='skip', delete_source=True)
+        result = speed_settings(settings)
+        self.assertEqual(asdict(result), {**asdict(settings), 'effort':7, 'priority':'normal', 'cpu_limit':100, 'parallel_jobs':2})
+        self.assertEqual((result.distance, result.long_edge, result.delete_source), (0.2, 6000, True))
+        flags = result.adobe_flags()
+        self.assertEqual(flags[flags.index('-jxl_effort')+1], '7')
+        self.assertEqual(flags[flags.index('-jxl_distance')+1], '0.2')
+        with self.assertRaises(ValueError):
+            speed_settings(replace(settings, mode=Mode.LOSSY_JPEG))
+
+    def test_cli_speed_preset_records_the_settings_actually_used(self):
+        args = make_parser().parse_args(['convert','RAW','--output','DNG','--speed','--distance','0.2','--long-edge','6000'])
+        settings = _settings(args)
+        self.assertEqual((settings.effort, settings.priority, settings.cpu_limit, settings.parallel_jobs), (7, 'normal', 100, 2))
+        self.assertEqual((settings.distance, settings.long_edge), (0.2, 6000))
+
+    def test_batch_per_output_time_uses_wall_time_not_sum_of_parallel_job_times(self):
+        jobs = self.jobs(2, 2)
+        # Each simulated file reports 6 minutes but the batch wall time is 7
+        # minutes. The average output interval must be 210, not 360 seconds.
+        clock = SimpleNamespace(value=100.0)
+        def convert(job, *_args, **_kwargs):
+            return Result(str(job.source.path), str(job.destination), 'ok', elapsed_seconds=360)
+        def event(kind, data):
+            if kind == 'done':
+                return
+            if kind == 'result':
+                clock.value = 520.0
+        converter = SimpleNamespace(executable=Path('fake-adobe'), version='16', convert=convert)
+        from unittest.mock import patch
+        with patch('raw_to_dng.core.time.monotonic', side_effect=lambda: clock.value):
+            _results, report = run_batch(converter, jobs, self.directory, on_event=event)
+        summary = json.loads(report.read_text(encoding='utf-8').splitlines()[-1])
+        self.assertEqual((summary['elapsed_seconds'], summary['seconds_per_success']), (420, 210))
 
     def test_source_deletion_checks_file_identity_and_all_saved_outputs(self):
         # Run file-system deletion guards on Windows as well as POSIX; the

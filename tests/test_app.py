@@ -467,9 +467,12 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         job = self.jobs(['highassertresources.NEF'], settings)[0]
         with patch('raw_to_dng.core.ProcessControl') as control:
             control.return_value.__enter__.return_value.enabled = True
+            control.return_value.throttled_seconds = 1.25
             result = self.converter.convert(job)
         self.assertEqual(result.status, 'ok', result.message)
         self.assertEqual(control.call_count, 3)
+        self.assertEqual(result.to_dict()['cpu_throttle_seconds'], 3.75)
+        self.assertEqual([a.cpu_throttle_seconds for a in result.attempts], [1.25] * 3)
         for call in control.call_args_list:
             self.assertEqual(call.args[1:], ('low', 50))
         for attempt in result.attempts:

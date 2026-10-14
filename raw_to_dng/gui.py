@@ -19,7 +19,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from . import __version__
 from .core import (
     ADOBE_DOWNLOAD_URL, COMPATIBILITIES, MAX_PARALLEL_JOBS, MODE_LABELS,
-    Converter, Mode, Settings, plan_jobs, resolve_converter, run_batch, scan_inputs,
+    Converter, Mode, Settings, plan_jobs, resolve_converter, run_batch, scan_inputs, speed_settings,
 )
 from .guide import QualityGuide
 from .progress import BatchProgress
@@ -237,8 +237,12 @@ class Application:
         self.widgets_to_disable.append(self.parallel_jobs_widget)
         self.parallel_jobs_widget.pack(side="left")
         ttk.Label(execution, text="（1＝順次、上限32）", style="Muted.TLabel").pack(side="left", padx=8)
-        self.delete_source_widget = self._check(main, "変換が成功した元ファイルを削除（スキップ・失敗したファイルは残す）", self.delete_source)
-        self.delete_source_widget.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        cleanup = ttk.Frame(main)
+        cleanup.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.delete_source_widget = self._check(cleanup, "変換が成功した元ファイルを削除（スキップ・失敗したファイルは残す）", self.delete_source)
+        self.delete_source_widget.pack(side="left")
+        self.speed_button = self._button(cleanup, "速度優先に設定", self._prefer_speed)
+        self.speed_button.pack(side="right")
         ttk.Label(main, textvariable=self.hint, wraplength=1020, style="Muted.TLabel").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         advanced.columnconfigure(1, weight=1)
@@ -404,6 +408,7 @@ class Application:
             self.effort_widget.configure(state="normal" if jxl and not self.busy else "disabled")
             self.jxl_retry_widget.configure(state="normal" if jxl and not self.busy else "disabled")
             self.effort_7_button.configure(state="normal" if jxl and not self.busy else "disabled")
+            self.speed_button.configure(state="normal" if jxl and not self.busy else "disabled")
             fallback_allowed = mode in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL) and self.resize.get() == "原寸を維持"
             if not fallback_allowed:
                 self.jxl_fallback.set(False)
@@ -420,6 +425,15 @@ class Application:
     def _prefer_effort7(self) -> None:
         self.effort.set("7")
         self.jxl_retry.set(True)
+
+    def _prefer_speed(self) -> None:
+        settings = speed_settings(self._collect_settings())
+        self.effort.set(str(settings.effort))
+        self.priority.set(PRIORITY_LABELS[settings.priority])
+        self.cpu_limit.set(str(settings.cpu_limit))
+        self.parallel_jobs.set(str(settings.parallel_jobs))
+        self._settings_changed()
+        self.status.set("速度優先：effort 7 / 優先度 通常 / CPU 100% / 並列2。画質指定・解像度は維持。並列数は実測で比較してください。")
 
     def _collect_settings(self) -> Settings:
         settings = Settings(
@@ -567,6 +581,8 @@ class Application:
                     self.status.set(f"完了 {data['ok']} / エラー {data['errors']} / スキップ {data['skipped']} / 未処理 {data['pending']}。詳細レポート: {self.last_report.name}")
                     if data.get("delete_source_requested"):
                         self.status.set(self.status.get() + f" / 元ファイル削除 {data['source_deleted']} / 削除失敗 {data['source_delete_errors']}")
+                    if data.get("seconds_per_success") is not None:
+                        self.status.set(self.status.get() + f" / 実績 {data['seconds_per_success']:.1f}秒/成功出力")
                 elif kind in ("fatal", "aborted"):
                     self.batch_progress.stopped = True
                     self.progress.stop()

@@ -10,29 +10,44 @@ PRIORITY_LABELS = {"normal": "通常", "low": "低め", "idle": "最低"}
 
 
 class CpuBudget:
-    """Share the requested CPU ceiling among currently running attempts."""
+    """A single CPU-time budget; idle attempts do not reserve CPU capacity."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._active = 0
+        self._balance = 0.0
+        self._last_wall = 0.0
 
     def acquire(self) -> None:
         with self._lock:
+            if self._active == 0:
+                self._balance, self._last_wall = 0.0, time.monotonic()
             self._active += 1
 
     def release(self) -> None:
         with self._lock:
             self._active -= 1
 
-    def share(self) -> float:
+    @property
+    def active(self) -> int:
         with self._lock:
-            return 1 / max(1, self._active)
+            return self._active
+
+    def pause(self, cpu_seconds: float, rate: float) -> float:
+        with self._lock:
+            now = time.monotonic()
+            # Every attempt reports only its CPU delta. Wall-time credit is
+            # added once for the whole batch, never once per worker.
+            self._balance = min(rate * 0.1, self._balance + (now - self._last_wall) * rate - max(0, cpu_seconds))
+            self._last_wall = now
+            return max(0, -self._balance / rate)
 
 
 class ProcessControl:
     def __init__(self, pid: int, priority: str, cpu_limit: int, *, api=None, cpus: int | None = None,
                  budget: CpuBudget | None = None):
         self._paused = []
+        self.throttled_seconds = 0.0
         self._budget, self._registered = budget, False
         self.enabled = priority != "normal" or cpu_limit < 100
         if not self.enabled:
@@ -48,7 +63,7 @@ class ProcessControl:
         except api.NoSuchProcess:
             self.enabled = False
             return
-        self._base_rate = self.rate = (cpus or api.cpu_count() or 1) * cpu_limit / 100
+        self.rate = (cpus or api.cpu_count() or 1) * cpu_limit / 100
         self.limited = cpu_limit < 100
         self._processes, self._totals = {}, {}
         self._balance = 0.0
@@ -100,15 +115,18 @@ class ProcessControl:
         active, cpu = self._snapshot()
         if not self.limited:
             return
-        if self._budget is not None:
-            self.rate = self._base_rate * self._budget.share()
         now = time.monotonic()
-        self._balance = min(self.rate * 0.1, self._balance + (now - self._last_wall) * self.rate - max(0, cpu - self._last_cpu))
+        cpu_delta = max(0, cpu - self._last_cpu)
+        if self._budget is not None:
+            pause = self._budget.pause(cpu_delta, self.rate)
+        else:
+            self._balance = min(self.rate * 0.1, self._balance + (now - self._last_wall) * self.rate - cpu_delta)
+            pause = max(0, -self._balance / self.rate)
         self._last_cpu, self._last_wall = cpu, now
-        pause = max(0, -self._balance / self.rate)
         if not active or pause < 0.01:
             return
         check_running()
+        pause_started = None
         try:
             for process in active:
                 try:
@@ -116,12 +134,19 @@ class ProcessControl:
                     self._paused.append(process)
                 except self.api.NoSuchProcess:
                     pass
+            if not self._paused:
+                return
+            pause_started = time.monotonic()
             until = time.monotonic() + pause
             while time.monotonic() < until:
                 cancel.wait(min(0.1, max(0, until - time.monotonic())))
                 check_running()
         finally:
-            self.close()
+            try:
+                self.close()
+            finally:
+                if pause_started is not None:
+                    self.throttled_seconds += max(0, time.monotonic() - pause_started)
 
     def close(self) -> None:
         failed, error = [], None
@@ -141,7 +166,6 @@ class ProcessControl:
         if self.enabled and self.limited and self._budget is not None:
             self._budget.acquire()
             self._registered = True
-            self.rate = self._base_rate * self._budget.share()
         return self
 
     def __exit__(self, *_args):

@@ -187,6 +187,15 @@ class Settings:
         return result
 
 
+def speed_settings(settings: Settings) -> Settings:
+    """A selected speed preset preserves all image/output options."""
+    if settings.mode != Mode.LOSSY_JXL:
+        raise ValueError("速度優先設定は画質指定JPEG XLで使用してください。")
+    result = replace(settings, effort=7, priority="normal", cpu_limit=100, parallel_jobs=2)
+    result.validate()
+    return result
+
+
 def validate_basename(value: str) -> str:
     if not value or value in (".", "..") or value[-1] in (" ", ".") or len(value) > 220:
         raise ValueError("出力ファイル名が不正です。")
@@ -416,6 +425,7 @@ class Attempt:
     log: str = ""
     message: str = ""
     elapsed_seconds: float = 0.0
+    cpu_throttle_seconds: float = 0.0
 
 
 @dataclass
@@ -440,6 +450,7 @@ class Result:
         result = asdict(self)
         result.pop("_source_identity")
         result["size_ratio"] = self.output_bytes / self.source_bytes if self.source_bytes else None
+        result["cpu_throttle_seconds"] = round(sum(attempt.cpu_throttle_seconds for attempt in self.attempts), 3)
         return result
 
 
@@ -520,13 +531,17 @@ class Converter:
                     try:
                         process = subprocess.Popen(attempt.command, stdout=log, stderr=subprocess.STDOUT,
                                                    stdin=subprocess.DEVNULL, shell=False, **kwargs)
-                        with ProcessControl(process.pid, settings.priority, settings.cpu_limit, budget=cpu_budget) as control:
-                            if (settings.priority != "normal" or settings.cpu_limit < 100) and not control.enabled and process.poll() is None:
-                                raise ConversionError("変換プロセスのCPU・優先度を制御できませんでした。")
-                            while process.poll() is None:
-                                cancel.wait(0.15)
-                                self._check_running(cancel, started, job.settings.timeout_seconds)
-                                control.update(cancel, lambda: self._check_running(cancel, started, job.settings.timeout_seconds))
+                        control = ProcessControl(process.pid, settings.priority, settings.cpu_limit, budget=cpu_budget)
+                        try:
+                            with control:
+                                if (settings.priority != "normal" or settings.cpu_limit < 100) and not control.enabled and process.poll() is None:
+                                    raise ConversionError("変換プロセスのCPU・優先度を制御できませんでした。")
+                                while process.poll() is None:
+                                    cancel.wait(0.15)
+                                    self._check_running(cancel, started, job.settings.timeout_seconds)
+                                    control.update(cancel, lambda: self._check_running(cancel, started, job.settings.timeout_seconds))
+                        finally:
+                            attempt.cpu_throttle_seconds = round(control.throttled_seconds, 3)
                     except BaseException:
                         if process is not None:
                             self._stop(process)
@@ -643,6 +658,7 @@ class Converter:
 def run_batch(converter: Converter, jobs: list[Job], report_directory: str | Path,
               cancel: threading.Event | None = None,
               on_event: Callable[[str, dict[str, Any]], None] | None = None) -> tuple[list[Result], Path]:
+    started = time.monotonic()
     cancel = cancel or threading.Event()
     event = on_event or (lambda *args: None)
     directory = Path(report_directory)
@@ -742,8 +758,11 @@ def run_batch(converter: Converter, jobs: list[Job], report_directory: str | Pat
                             "settings": jobs[index].settings.to_dict(), **results_by_index[index].to_dict()}
                     record(data)
                     event("source_delete", data)
+        elapsed = max(0, time.monotonic() - started)
+        ok = sum(r.status == "ok" for r in results)
         summary = {"type": "summary", "completed": len(results), "pending": len(jobs) - len(results),
-                   "ok": sum(r.status == "ok" for r in results),
+                   "ok": ok, "elapsed_seconds": round(elapsed, 3),
+                   "seconds_per_success": round(elapsed / ok, 3) if ok else None,
                    "errors": sum(r.status == "error" for r in results),
                    "skipped": sum(r.status == "skipped" for r in results), "cancelled": cancel.is_set(),
                    "delete_source_requested": any(job.settings.delete_source for job in jobs),

@@ -125,24 +125,56 @@ class ResourceTests(unittest.TestCase):
         root.descendants = []
         self.assertEqual(control._snapshot()[1], 2)
 
-    def test_parallel_controls_share_and_reclaim_the_total_cpu_budget(self):
+    def test_idle_worker_does_not_reserve_cpu_or_throttle_another_worker(self):
         clock, budget = FakeClock(), CpuBudget()
-        first = self.control(FakeProcess(1), clock, limit=1, cpus=4)
-        second = self.control(FakeProcess(2), clock, limit=1, cpus=4)
+        root = FakeProcess(1)
+        first = self.control(root, clock, limit=25, cpus=4)
+        second = self.control(FakeProcess(2), clock, limit=25, cpus=4)
         first._budget = second._budget = budget
         with patch('raw_to_dng.resources.time.monotonic', clock):
             with first:
-                self.assertAlmostEqual(first.rate, 0.04)
                 with second:
+                    root.cpu, clock.value = 0.18, 0.2
                     first.update(FakeEvent(clock), lambda: None)
-                    self.assertAlmostEqual(first.rate + second.rate, 0.04)
-                    self.assertAlmostEqual(second.rate, 0.02)
-                    # Throttle cleanup does not release a live worker's share.
+                    self.assertAlmostEqual(clock.value, 0.2)
+                    self.assertEqual(first.throttled_seconds, 0)
+                    self.assertEqual(root.resumed, 0)
                     second.close()
-                    self.assertEqual(budget.share(), 0.5)
+                    self.assertEqual(budget.active, 2)
                 first.update(FakeEvent(clock), lambda: None)
-                self.assertAlmostEqual(first.rate, 0.04)
-        self.assertEqual(budget.share(), 1)
+                self.assertEqual(budget.active, 1)
+        self.assertEqual(budget.active, 0)
+
+    def test_shared_budget_counts_cpu_from_all_workers_and_wall_time_once(self):
+        clock, budget = FakeClock(), CpuBudget()
+        with patch('raw_to_dng.resources.time.monotonic', clock):
+            budget.acquire()
+            budget.acquire()
+            clock.value = 0.1
+            self.assertAlmostEqual(budget.pause(0.2, 1), 0.1)
+            self.assertAlmostEqual(budget.pause(0.2, 1), 0.3)
+            clock.value = 0.4
+            self.assertEqual(budget.pause(0, 1), 0)
+            budget.release()
+            budget.release()
+
+    def test_shared_throttle_is_measured_and_cancel_remains_responsive(self):
+        clock, budget, root = FakeClock(), CpuBudget(), FakeProcess(1)
+        control = self.control(root, clock, limit=25, cpus=1)
+        control._budget = budget
+        event = FakeEvent(clock, stop=True)
+        def check():
+            if event.cancelled:
+                raise InterruptedError('cancelled')
+        with patch('raw_to_dng.resources.time.monotonic', clock):
+            with self.assertRaises(InterruptedError):
+                with control:
+                    root.cpu, clock.value = 1, 0.1
+                    control.update(event, check)
+        self.assertGreater(control.throttled_seconds, 0)
+        self.assertLessEqual(control.throttled_seconds, 0.1)
+        self.assertFalse(root.paused)
+        self.assertEqual(budget.active, 0)
 
     def test_failed_attempt_returns_its_cpu_share(self):
         control = self.control(FakeProcess(1), FakeClock())
@@ -150,7 +182,39 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             with control:
                 raise RuntimeError('failed converter')
-        self.assertEqual(budget.share(), 1)
+        self.assertEqual(budget.active, 0)
+
+    def test_real_parallel_processes_respect_a_shared_cpu_ceiling(self):
+        if sys.platform.startswith('linux') and int(os.readlink('/proc/self')) != os.getpid():
+            self.skipTest('Virtual process IDs differ from procfs; native process control is tested in CI.')
+        processes = []
+        try:
+            for _ in range(2):
+                processes.append(subprocess.Popen([sys.executable, '-c', 'while True: pass'],
+                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            budget = CpuBudget()
+            started = time.monotonic()
+            with ProcessControl(processes[0].pid, 'normal', 25, cpus=1, budget=budget) as first, \
+                 ProcessControl(processes[1].pid, 'normal', 25, cpus=1, budget=budget) as second:
+                def check():
+                    if time.monotonic() - started > 6:
+                        raise TimeoutError('test deadline')
+                while time.monotonic() - started < 1.2:
+                    time.sleep(0.05)
+                    first.update(threading.Event(), check)
+                    second.update(threading.Event(), check)
+                elapsed = time.monotonic() - started
+                usage = [psutil.Process(process.pid).cpu_times() for process in processes]
+                self.assertLess(sum(cpu.user + cpu.system for cpu in usage) / elapsed, 0.65)
+            self.assertEqual(budget.active, 0)
+        finally:
+            for process in processes:
+                process.terminate()
+            for process in processes:
+                try: process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
 
     def test_real_child_priority_and_cpu_usage_are_regulated(self):
         if sys.platform.startswith('linux') and int(os.readlink('/proc/self')) != os.getpid():

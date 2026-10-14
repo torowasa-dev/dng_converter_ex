@@ -13,7 +13,7 @@ from pathlib import Path
 from . import __version__
 from .core import (
     COMPATIBILITIES, Converter, Mode, Settings, converter_version,
-    plan_jobs, resolve_converter, run_batch, scan_inputs,
+    plan_jobs, resolve_converter, run_batch, scan_inputs, speed_settings,
 )
 from .dng import inspect_dng
 
@@ -25,6 +25,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=[mode.value for mode in Mode], default=Mode.LOSSY_JXL.value)
     parser.add_argument("--distance", type=float, default=0.1, help="JPEG XL画質: 0〜6、小さいほど高画質")
     parser.add_argument("--effort", type=int, default=7)
+    parser.add_argument("--speed", action="store_true", help="速度優先：effort 7・通常優先度・CPU100%%・並列2。画質指定と解像度は維持")
     parser.add_argument("--jobs", "-j", type=int, default=1, help="並列実行数（1〜32、初期値1）")
     parser.add_argument("--delete-source", action="store_true", help="成功した元ファイルを削除（初期OFF、同じ入力の全出力成功後）")
     parser.add_argument("--priority", choices=("normal", "low", "idle"), default="normal", help="変換プロセスの優先度")
@@ -80,6 +81,8 @@ def _settings(args) -> Settings:
                       jxl_retry=not args.no_jxl_retry, jxl_fallback=args.jxl_fallback,
                       priority=args.priority, cpu_limit=args.cpu_limit, parallel_jobs=args.jobs,
                       delete_source=args.delete_source)
+    if args.speed:
+        result = speed_settings(result)
     result.validate()
     return result
 
@@ -145,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[{data['source_delete_status']}] {Path(data['source']).name}: {data['source_delete_message']}", flush=True)
             elif kind == "done":
                 print(f"report: {data['report']}", flush=True)
+                if data.get("seconds_per_success") is not None:
+                    print(f"実績: {data['seconds_per_success']:.1f}秒/成功出力（バッチ全体の経過時間から計算）", flush=True)
         try:
             results, _report = run_batch(converter, jobs, output, cancel, event)
         finally:
