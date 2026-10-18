@@ -18,6 +18,7 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -31,6 +32,7 @@ RAW_EXTENSIONS = frozenset(".3fr .arw .bay .cap .cr2 .cr3 .crw .dcs .dcr .drf .e
 ADOBE_DOWNLOAD_URL = "https://helpx.adobe.com/camera-raw/desktop/dng-and-file-formats/adobe-dng-converter.html"
 COMPATIBILITIES = ("2.4", "4.1", "4.6", "5.4", "6.6", "7.1", "11.2", "12.4", "13.2", "14.0", "15.3")
 MAX_PARALLEL_JOBS = 32
+OVERSIZE_ACTION_LABELS = {"fail": "失敗として次へ進む", "increase-distance": "distanceを上げて再変換"}
 
 
 class ConversionError(RuntimeError):
@@ -39,6 +41,16 @@ class ConversionError(RuntimeError):
 
 class Cancelled(ConversionError):
     pass
+
+
+class OutputTooLarge(ConversionError):
+    """A validated staged output exceeded the whole-file byte limit."""
+
+    def __init__(self, actual_bytes: int, limit_bytes: int):
+        self.actual_bytes = actual_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(f"最大ファイルサイズ超過: {actual_bytes / 1_000_000:.6f} MB "
+                         f"> {limit_bytes / 1_000_000:.6f} MB。出力を破棄しました。")
 
 
 class AdobeProcessError(ConversionError):
@@ -95,6 +107,15 @@ class Settings:
     cpu_limit: int = 100
     parallel_jobs: int = 1
     delete_source: bool = False
+    max_file_mb: float = 0.0
+    oversize_action: str = "fail"
+    distance_step: float = 0.1
+    max_distance: float = 6.0
+
+    @property
+    def max_file_bytes(self) -> int | None:
+        # Decimal MB agrees with the GUI's output-size display; never round up.
+        return int(Decimal(str(self.max_file_mb)) * 1_000_000) if self.max_file_mb else None
 
     @property
     def pixel_limit(self) -> int | None:
@@ -111,8 +132,24 @@ class Settings:
             raise ValueError(f"並列実行数は1〜{MAX_PARALLEL_JOBS}です。")
         if type(self.delete_source) is not bool:
             raise ValueError("成功した元ファイルの削除はON/OFFで指定してください。")
+        if (type(self.max_file_mb) not in (int, float) or not math.isfinite(self.max_file_mb)
+                or self.max_file_mb < 0 or self.max_file_mb > 0 and self.max_file_bytes < 1):
+            raise ValueError("最大ファイルサイズは0（制限なし）、または1バイト以上のMB値です。")
+        if self.oversize_action not in ("fail", "increase-distance"):
+            raise ValueError("サイズ超過時の処理が不正です。")
+        if (type(self.distance_step) not in (int, float) or not math.isfinite(self.distance_step)
+                or not 0.000001 <= self.distance_step <= 6):
+            raise ValueError("distanceの増分は0.000001〜6です。")
+        if (type(self.max_distance) not in (int, float) or not math.isfinite(self.max_distance)
+                or not 0 <= self.max_distance <= 6):
+            raise ValueError("自動調整のdistance上限は0〜6です。")
         if not math.isfinite(self.distance) or not 0 <= self.distance <= 6:
             raise ValueError("JPEG XL distanceは0〜6です。小さいほど高画質です。")
+        if self.max_file_mb and self.oversize_action == "increase-distance":
+            if self.mode != Mode.LOSSY_JXL:
+                raise ValueError("distanceの自動調整は画質指定JPEG XLでのみ使用できます。")
+            if self.max_distance < self.distance:
+                raise ValueError("distance上限は開始distance以上にしてください。")
         if not isinstance(self.effort, int) or not 1 <= self.effort <= 9:
             raise ValueError("JPEG XL effortは1〜9です。大きいほど処理に時間をかけます。")
         if self.megapixels is not None and (not math.isfinite(self.megapixels) or not 0.001 <= self.megapixels <= 500):
@@ -157,7 +194,7 @@ class Settings:
         self.validate()
         flags: list[str] = []
         if self.mode == Mode.LOSSY_JXL:
-            flags += ["-dng1.7", "-lossy", "-jxl", "-jxl_distance", format(self.distance, ".8g"), "-jxl_effort", str(self.effort)]
+            flags += ["-dng1.7", "-lossy", "-jxl", "-jxl_distance", format(self.distance, ".15g"), "-jxl_effort", str(self.effort)]
         elif self.mode == Mode.LOSSLESS_JXL:
             flags += ["-losslessJXL"]
         elif self.mode == Mode.LOSSY_JPEG:
@@ -184,6 +221,7 @@ class Settings:
         result["adobe_pixel_limit"] = self.pixel_limit
         result["adobe_jxl_effort"] = self.effort if self.mode == Mode.LOSSY_JXL else None
         result["adobe_jxl_distance"] = self.distance if self.mode == Mode.LOSSY_JXL else None
+        result["max_file_bytes"] = self.max_file_bytes
         return result
 
 
@@ -426,6 +464,7 @@ class Attempt:
     message: str = ""
     elapsed_seconds: float = 0.0
     cpu_throttle_seconds: float = 0.0
+    output_bytes: int = 0
 
 
 @dataclass
@@ -560,6 +599,12 @@ class Converter:
                 self._check_source(job, source_stat)
                 info = inspect_dng(stage)
                 verify_output(info, settings)
+                attempt.output_bytes = stage.stat().st_size
+                # Measure the complete DNG, including previews, metadata and
+                # embedded RAW, before publication or deleting any source.
+                limit = settings.max_file_bytes
+                if limit is not None and attempt.output_bytes > limit:
+                    raise OutputTooLarge(attempt.output_bytes, limit)
                 if settings.preserve_mtime:
                     os.utime(stage, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
                 self._check_running(cancel, started, job.settings.timeout_seconds)
@@ -579,6 +624,8 @@ class Converter:
                     elif settings.effort != job.settings.effort:
                         efforts = "→".join(str(a.settings["effort"]) for a in result.attempts)
                         result.message += f" / effort {efforts}で再試行成功"
+                    if settings.distance != job.settings.distance:
+                        result.message += f" / サイズ調整 distance {job.settings.distance:g}→{settings.distance:g}"
                 attempt.status, attempt.message = result.status, result.message
         except Cancelled as exc:
             attempt.status, attempt.message = "cancelled", str(exc)
@@ -617,12 +664,22 @@ class Converter:
                 return result
             job.destination.parent.mkdir(parents=True, exist_ok=True)
             reason = "初回"
-            # At most: effort 9 -> 8 -> 7 -> opt-in lossless JPEG.
-            # Effort 5 remains a manual experiment, not a verified workaround.
-            for _ in range(4):
+            # Each iteration increases distance, decreases effort, or switches
+            # once to lossless JPEG. Cancellation and one shared timeout bound
+            # the entire job; every attempt reconverts the original source.
+            while True:
                 try:
                     self._attempt(job, settings, cancel, started, source_stat, result, reason, cpu_budget, reserved)
                     break
+                except OutputTooLarge as exc:
+                    if settings.oversize_action != "increase-distance" or settings.mode != Mode.LOSSY_JXL:
+                        raise
+                    if settings.distance >= settings.max_distance:
+                        raise ConversionError(f"distance上限 {settings.max_distance:g}でもサイズ制限内に収まりません。{exc}") from exc
+                    next_distance = float(min(Decimal(str(settings.max_distance)),
+                                              Decimal(str(settings.distance)) + Decimal(str(settings.distance_step))))
+                    reason = f"サイズ超過: distance {settings.distance:g}→{next_distance:g}で再試行"
+                    settings = replace(settings, distance=next_distance)
                 except AdobeProcessError as exc:
                     if settings.mode not in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL) or not is_jxl_histogram_assert(exc.output):
                         raise
@@ -632,12 +689,13 @@ class Converter:
                         settings = replace(settings, effort=next_effort)
                     elif settings.jxl_fallback:
                         reason = "ロスレスJPEGへ変更（原寸）"
-                        settings = replace(settings, mode=Mode.LOSSLESS_JPEG, jxl_retry=False, jxl_fallback=False)
+                        settings = replace(settings, mode=Mode.LOSSLESS_JPEG, jxl_retry=False, jxl_fallback=False,
+                                           oversize_action="fail")
                     else:
                         raise
-                    if on_retry:
-                        on_retry({"attempt": len(result.attempts) + 1, "message": reason,
-                                  "settings": settings.to_dict()})
+                if on_retry:
+                    on_retry({"attempt": len(result.attempts) + 1, "message": reason,
+                              "settings": settings.to_dict()})
             if result.status == "ok" and settings.delete_source:
                 if defer_source_delete:
                     result.source_delete_status = "pending"
@@ -771,3 +829,4 @@ def run_batch(converter: Converter, jobs: list[Job], report_directory: str | Pat
         record(summary)
         event("done", summary)
     return results, report_path
+

@@ -25,6 +25,11 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=[mode.value for mode in Mode], default=Mode.LOSSY_JXL.value)
     parser.add_argument("--distance", type=float, default=0.1, help="JPEG XL画質: 0〜6、小さいほど高画質")
     parser.add_argument("--effort", type=int, default=7)
+    parser.add_argument("--max-file-mb", type=float, default=0, help="完成DNGの最大MB（1 MB＝1,000,000バイト、0＝制限なし）")
+    parser.add_argument("--oversize-action", choices=("fail", "increase-distance"), default="fail",
+                        help="サイズ超過時：失敗として次へ、またはdistanceを増加して再変換（JPEG XLのみ）")
+    parser.add_argument("--distance-step", type=float, default=0.1, help="サイズ超過時のdistance増分（0.000001〜6）")
+    parser.add_argument("--max-distance", type=float, default=6, help="自動調整のdistance上限（0〜6）")
     parser.add_argument("--speed", action="store_true", help="速度優先：effort 7・通常優先度・CPU100%%・並列2。画質指定と解像度は維持")
     parser.add_argument("--jobs", "-j", type=int, default=1, help="並列実行数（1〜32、初期値1）")
     parser.add_argument("--delete-source", action="store_true", help="成功した元ファイルを削除（初期OFF、同じ入力の全出力成功後）")
@@ -80,7 +85,9 @@ def _settings(args) -> Settings:
                       strict_wb=not args.allow_missing_wb, preserve_mtime=not args.no_preserve_mtime,
                       jxl_retry=not args.no_jxl_retry, jxl_fallback=args.jxl_fallback,
                       priority=args.priority, cpu_limit=args.cpu_limit, parallel_jobs=args.jobs,
-                      delete_source=args.delete_source)
+                      delete_source=args.delete_source, max_file_mb=args.max_file_mb,
+                      oversize_action=args.oversize_action, distance_step=args.distance_step,
+                      max_distance=args.max_distance)
     if args.speed:
         result = speed_settings(result)
     result.validate()
@@ -158,3 +165,4 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 2
+

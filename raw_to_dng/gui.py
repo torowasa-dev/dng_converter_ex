@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__
 from .core import (
-    ADOBE_DOWNLOAD_URL, COMPATIBILITIES, MAX_PARALLEL_JOBS, MODE_LABELS,
+    ADOBE_DOWNLOAD_URL, COMPATIBILITIES, MAX_PARALLEL_JOBS, MODE_LABELS, OVERSIZE_ACTION_LABELS,
     Converter, Mode, Settings, plan_jobs, resolve_converter, run_batch, scan_inputs, speed_settings,
 )
 from .guide import QualityGuide
@@ -93,6 +93,10 @@ class Application:
         self.cpu_limit = tk.StringVar(value="100")
         self.parallel_jobs = tk.StringVar(value="1")
         self.delete_source = tk.BooleanVar(value=False)
+        self.max_file_mb = tk.StringVar(value="0")
+        self.oversize_action = tk.StringVar(value=OVERSIZE_ACTION_LABELS["fail"])
+        self.distance_step = tk.StringVar(value="0.1")
+        self.max_distance = tk.StringVar(value="6")
         self.jxl_retry = tk.BooleanVar(value=True)
         self.jxl_fallback = tk.BooleanVar(value=False)
         self.hint = tk.StringVar()
@@ -168,8 +172,10 @@ class Application:
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill="x")
         main = ttk.Frame(self.notebook, padding=12)
+        size_options = ttk.Frame(self.notebook, padding=12)
         advanced = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(main, text="変換設定")
+        self.notebook.add(size_options, text="出力サイズ")
         self.notebook.add(advanced, text="詳細設定")
         main.columnconfigure(0, weight=1)
         main.columnconfigure(1, weight=0)
@@ -189,6 +195,28 @@ class Application:
         toggles.pack(fill="x", pady=(6, 0))
         self._check(toggles, "サブフォルダーも対象", self.recursive).pack(anchor="w")
         self._check(toggles, "フォルダー走査でDNGも対象にする", self.include_dng).pack(anchor="w")
+
+        size = ttk.LabelFrame(size_options, text="出力ファイルサイズ", padding=12)
+        size.pack(anchor="nw")
+        ttk.Label(size, text="最大サイズ").grid(row=0, column=0, sticky="w")
+        self._entry(size, self.max_file_mb, width=9).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(size, text="MB（0＝制限なし）").grid(row=0, column=2, columnspan=2, sticky="w")
+        ttk.Label(size, text="超過時").grid(row=1, column=0, sticky="w", pady=4)
+        self.oversize_action_widget = self._combo(size, self.oversize_action, OVERSIZE_ACTION_LABELS.values(), 28)
+        self.oversize_action_widget.grid(row=1, column=1, columnspan=3, sticky="w", padx=6, pady=4)
+        self.oversize_action_widget.bind("<<ComboboxSelected>>", self._settings_changed)
+        ttk.Label(size, text="distance増分").grid(row=2, column=0, sticky="w")
+        self.distance_step_widget = self._entry(size, self.distance_step, width=9)
+        self.distance_step_widget.grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(size, text="上限").grid(row=2, column=2, sticky="w")
+        self.max_distance_widget = self._entry(size, self.max_distance, width=9)
+        self.max_distance_widget.grid(row=2, column=3, sticky="w", padx=6)
+        ttk.Label(size, text="1 MB＝1,000,000バイト。自動調整はJPEG XLのみ。", style="Muted.TLabel").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(size_options, text="完成したDNG全体で判定します。超過した出力は破棄し、元ファイルを保持します。\n"
+                  "自動調整では元RAWから再変換します。distanceを上げると画質が下がります。\n"
+                  "distance上限でも収まらない場合は失敗として次のファイルへ進みます。",
+                  style="Muted.TLabel", wraplength=960).pack(anchor="w", pady=12)
 
         settings = ttk.LabelFrame(main, text="圧縮・解像度", padding=10)
         settings.grid(row=0, column=1, sticky="nsew")
@@ -402,6 +430,12 @@ class Application:
         mode = self._selected_mode()
         jxl = mode == Mode.LOSSY_JXL
         if hasattr(self, "quality_widget"):
+            if not jxl:
+                self.oversize_action.set(OVERSIZE_ACTION_LABELS["fail"])
+            self.oversize_action_widget.configure(state="readonly" if jxl and not self.busy else "disabled")
+            adjust_size = jxl and self.oversize_action.get() == OVERSIZE_ACTION_LABELS["increase-distance"] and not self.busy
+            self.distance_step_widget.configure(state="normal" if adjust_size else "disabled")
+            self.max_distance_widget.configure(state="normal" if adjust_size else "disabled")
             self.collision_widget.configure(state="disabled" if self.skip_existing.get() or self.busy else "readonly")
             self.quality_widget.configure(state="readonly" if jxl and not self.busy else "disabled")
             self.distance_widget.configure(state="normal" if jxl and not self.busy else "disabled")
@@ -450,6 +484,9 @@ class Application:
             priority=next(key for key, label in PRIORITY_LABELS.items() if label == self.priority.get()),
             cpu_limit=int(self.cpu_limit.get()), parallel_jobs=int(self.parallel_jobs.get()),
             delete_source=self.delete_source.get(),
+            max_file_mb=float(self.max_file_mb.get()),
+            oversize_action=next(key for key, label in OVERSIZE_ACTION_LABELS.items() if label == self.oversize_action.get()),
+            distance_step=float(self.distance_step.get()), max_distance=float(self.max_distance.get()),
         )
         settings.validate()
         return settings
@@ -648,6 +685,8 @@ class Application:
                 self.collision.set("連番を付ける")
             if self.priority.get() not in PRIORITY_LABELS.values():
                 self.priority.set(PRIORITY_LABELS["normal"])
+            if self.oversize_action.get() not in OVERSIZE_ACTION_LABELS.values():
+                self.oversize_action.set(OVERSIZE_ACTION_LABELS["fail"])
         except (OSError, ValueError, TypeError, tk.TclError):
             pass
         if not self.converter.get():
@@ -661,7 +700,8 @@ class Application:
         return ("converter", "output", "mode", "quality", "distance", "effort", "resize", "megapixels", "long_edge", "preview",
                 "compatibility", "collision", "name_template", "start_index", "timeout", "recursive", "preserve_folders",
                 "include_dng", "fast_load", "embed_original", "linear", "strict_wb", "preserve_mtime",
-                "skip_existing", "jxl_retry", "jxl_fallback", "priority", "cpu_limit", "parallel_jobs", "delete_source")
+                "skip_existing", "jxl_retry", "jxl_fallback", "priority", "cpu_limit", "parallel_jobs", "delete_source",
+                "max_file_mb", "oversize_action", "distance_step", "max_distance")
 
     def _save_settings(self) -> None:
         try:
@@ -701,3 +741,4 @@ def launch(initial_inputs: list[str] | None = None) -> None:
     root = tk.Tk()
     Application(root, initial_inputs)
     root.mainloop()
+
