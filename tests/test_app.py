@@ -248,7 +248,9 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
             path = self.base / name
             path.write_bytes(b"raw source unchanged")
             sources.append(Source(path))
-        return plan_jobs(sources, self.output, settings or Settings())
+        # Legacy recovery tests exercise the opt-out path; unlimited retry is
+        # covered separately with finite failure sequences and cancellation.
+        return plan_jobs(sources, self.output, replace(settings or Settings(), retry_until_success=False))
 
     def history(self, job):
         return [json.loads(line) for line in job.source.path.with_suffix('.attempts.jsonl').read_text(encoding='utf-8').splitlines()]
@@ -364,7 +366,7 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
 
     def test_quality_comparison_keeps_source_when_one_output_fails(self):
         source = self.jobs(['alwaysassertshared.NEF'])[0].source
-        settings = Settings(parallel_jobs=2, delete_source=True)
+        settings = Settings(parallel_jobs=2, delete_source=True, retry_until_success=False)
         jobs = [plan_jobs([source], self.output / 'jxl', settings)[0],
                 plan_jobs([source], self.output / 'jpeg', replace(settings, mode=Mode.LOSSLESS_JPEG))[0]]
         results, _report = run_batch(self.converter, jobs, self.output)
@@ -670,6 +672,38 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
         self.assertFalse(job.destination.exists())
         self.assertEqual(list(self.output.glob(".raw-to-dng-*")), [])
 
+    def test_unlimited_retry_repeats_non_jxl_process_errors_until_cancel(self):
+        job = self.jobs(["gpuerror.NEF"], Settings(jxl_retry=False))[0]
+        job = replace(job, settings=replace(job.settings, retry_until_success=True))
+        cancel = threading.Event()
+        retries = []
+        def on_retry(data):
+            retries.append(data)
+            if len(retries) == 5:
+                cancel.set()
+        result = self.converter.convert(job, cancel, on_retry=on_retry)
+        self.assertEqual(result.status, "cancelled", result.message)
+        self.assertEqual(len(self.history(job)), 5)
+        self.assertTrue(job.source.path.exists())
+        self.assertFalse(job.destination.exists())
+        self.assertEqual(list(self.output.glob(".raw-to-dng-*")), [])
+
+    def test_unlimited_retry_resets_timeout_for_each_process_and_is_cancellable(self):
+        job = self.jobs(["hang.NEF"], Settings(timeout_seconds=0.3))[0]
+        job = replace(job, settings=replace(job.settings, retry_until_success=True))
+        cancel = threading.Event()
+        retries = []
+        def on_retry(data):
+            retries.append(data)
+            if len(retries) == 2:
+                cancel.set()
+        result = self.converter.convert(job, cancel, on_retry=on_retry)
+        self.assertEqual(result.status, "cancelled", result.message)
+        self.assertEqual(len(self.history(job)), 2)
+        self.assertEqual([attempt.status for attempt in result.attempts], ["error", "error"])
+        self.assertTrue(all("タイムアウト" in attempt.message for attempt in result.attempts))
+        self.assertEqual(list(self.output.glob(".raw-to-dng-*")), [])
+
     def test_cancel_stops_current_job_and_preserves_pending_jobs(self):
         jobs = self.jobs(["hang.NEF", "pending.NEF"])
         cancel = threading.Event()
@@ -718,3 +752,4 @@ make_dng(dest, width=w, height=h, compression=compression, linear=lossy or '-l' 
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -6,6 +6,16 @@ from raw_to_dng.progress import BatchProgress, format_remaining
 
 
 class ProgressTests(unittest.TestCase):
+    def test_outcome_counts_exclude_skips_cancellation_and_duplicate_events(self):
+        progress = BatchProgress()
+        progress.plan([True] * 4)
+        for index, status in enumerate(("ok", "error", "skipped", "cancelled")):
+            progress.result(index, status, 10, True)
+            progress.result(index, status, 10, True)  # source_delete repeats result
+        self.assertEqual((progress.succeeded, progress.errors), (1, 1))
+        progress.plan([True])
+        self.assertEqual((progress.succeeded, progress.errors), (0, 0))
+
     def test_total_and_remaining_include_skips_and_errors(self):
         progress = BatchProgress()
         progress.plan([True, False, True])
@@ -107,3 +117,4 @@ class ProgressTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

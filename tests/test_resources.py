@@ -9,9 +9,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
-from raw_to_dng.resources import CpuBudget, ProcessControl
+from raw_to_dng.resources import CpuBudget, ProcessControl, ProcessControlError
 
 
 class FakeProcess:
@@ -38,6 +41,9 @@ class FakeProcess:
 class Gone(Exception): pass
 
 
+class Denied(Exception): pass
+
+
 class FakeClock:
     value = 0.0
     def __call__(self): return self.value
@@ -52,11 +58,65 @@ class FakeEvent:
 
 
 class ResourceTests(unittest.TestCase):
-    def control(self, root, clock, priority='low', limit=25, cpus=1):
+    def control(self, root, clock, priority='low', limit=25, cpus=1, has_exited=None):
         api = SimpleNamespace(Process=lambda pid: root, cpu_count=lambda: 4, NoSuchProcess=Gone,
+                              AccessDenied=Denied,
                               BELOW_NORMAL_PRIORITY_CLASS=0x4000, IDLE_PRIORITY_CLASS=0x40)
         with patch('raw_to_dng.resources.time.monotonic', clock):
-            return ProcessControl(root.pid, priority, limit, api=api, cpus=cpus)
+            return ProcessControl(root.pid, priority, limit, api=api, cpus=cpus, has_exited=has_exited)
+
+    def test_exit_race_access_denied_during_cpu_snapshot_is_ignored(self):
+        root, clock = FakeProcess(6292), FakeClock()
+        ended = [False]
+        control = self.control(root, clock, has_exited=lambda: ended[0])
+        def denied():
+            raise Denied('(pid=6292)')
+        root.cpu_times = denied
+        ended[0] = True
+        control.update(FakeEvent(clock), lambda: None)
+        self.assertEqual(control._processes, {})
+
+    def test_live_process_access_denied_is_a_typed_retryable_error(self):
+        root, clock = FakeProcess(6292), FakeClock()
+        control = self.control(root, clock, has_exited=lambda: False)
+        def denied():
+            raise Denied('(pid=6292)')
+        root.cpu_times = denied
+        with self.assertRaisesRegex(ProcessControlError, 'Denied.*pid=6292'):
+            control.update(FakeEvent(clock), lambda: None)
+
+    def test_exited_root_does_not_hide_access_denied_for_a_live_child(self):
+        child, clock = FakeProcess(2), FakeClock()
+        root = FakeProcess(1, [child])
+        ended = [False]
+        control = self.control(root, clock, has_exited=lambda: ended[0])
+        def denied():
+            raise Denied('(pid=2)')
+        child.cpu_times = denied
+        ended[0] = True
+        with self.assertRaises(ProcessControlError):
+            control.update(FakeEvent(clock), lambda: None)
+
+    def test_access_denied_resuming_an_exited_root_is_not_a_conversion_failure(self):
+        root, clock = FakeProcess(6292), FakeClock()
+        control = self.control(root, clock, has_exited=lambda: True)
+        def denied():
+            raise Denied('(pid=6292)')
+        root.resume = denied
+        control._paused = [root]
+        control.close()
+        self.assertEqual(control._paused, [])
+
+    def test_access_denied_resuming_a_live_process_remains_an_error(self):
+        root, clock = FakeProcess(6292), FakeClock()
+        control = self.control(root, clock, has_exited=lambda: False)
+        def denied():
+            raise Denied('(pid=6292)')
+        root.resume = denied
+        control._paused = [root]
+        with self.assertRaises(ProcessControlError):
+            control.close()
+        self.assertEqual(control._paused, [root])
 
     def test_defaults_do_not_modify_or_monitor_processes(self):
         with ProcessControl(0, 'normal', 100) as control:
@@ -184,6 +244,7 @@ class ResourceTests(unittest.TestCase):
                 raise RuntimeError('failed converter')
         self.assertEqual(budget.active, 0)
 
+    @unittest.skipIf(psutil is None, "psutil is required for native process tests")
     def test_real_parallel_processes_respect_a_shared_cpu_ceiling(self):
         if sys.platform.startswith('linux') and int(os.readlink('/proc/self')) != os.getpid():
             self.skipTest('Virtual process IDs differ from procfs; native process control is tested in CI.')
@@ -244,6 +305,7 @@ class ResourceTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=3)
 
+    @unittest.skipIf(psutil is None, "psutil is required for native process tests")
     def test_real_child_priority_and_cpu_usage_are_regulated(self):
         if sys.platform.startswith('linux') and int(os.readlink('/proc/self')) != os.getpid():
             self.skipTest('Virtual process IDs differ from procfs; native process control is tested in CI.')
@@ -273,3 +335,4 @@ class ResourceTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+

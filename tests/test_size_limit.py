@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from raw_to_dng.cli import _settings, make_parser
 from raw_to_dng.core import Converter, Mode, Settings, Source, plan_jobs, run_batch
+from raw_to_dng.resources import ProcessControlError
 from tests.fixtures import make_dng
 
 
@@ -57,6 +58,7 @@ class SizeLimitTests(unittest.TestCase):
         patch("raw_to_dng.core.ProcessControl", return_value=MagicMock(enabled=True, throttled_seconds=0)).start()
 
     def job(self, **kwargs):
+        kwargs.setdefault("retry_until_success", False)
         return plan_jobs([Source(self.source)], self.output, Settings(**kwargs))[0]
 
     def distances(self):
@@ -64,6 +66,75 @@ class SizeLimitTests(unittest.TestCase):
 
     def assert_clean(self):
         self.assertEqual(list(self.output.glob(".raw-to-dng-*")), [])
+
+    def test_unlimited_retry_succeeds_after_more_than_four_failures(self):
+        for mode in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL, Mode.LOSSLESS_JPEG):
+            with self.subTest(mode=mode):
+                self.commands.clear()
+                self.failures = set(range(6))
+                job = self.job(mode=mode, effort=9, retry_until_success=True)
+                retries = []
+                with patch("raw_to_dng.core.threading.Event.wait", return_value=False):
+                    result = self.converter.convert(job, on_retry=retries.append)
+                self.assertEqual(result.status, "ok", result.message)
+                self.assertEqual(len(result.attempts), 7)
+                self.assertEqual([data["attempt"] for data in retries], list(range(2, 8)))
+                self.assertEqual(result.effective_settings["distance"], 0.1)
+                self.assertTrue(self.source.exists())
+                self.assert_clean()
+
+    def test_failed_fallback_also_retries_without_a_count_limit(self):
+        self.failures = set(range(5))
+        job = self.job(effort=9, jxl_fallback=True, retry_until_success=True)
+        with patch("raw_to_dng.core.threading.Event.wait", return_value=False):
+            result = self.converter.convert(job)
+        self.assertEqual(result.status, "ok", result.message)
+        self.assertEqual([a.settings["mode"] for a in result.attempts],
+                         ["lossy-jxl"] * 3 + ["lossless-jpeg"] * 3)
+        self.assert_clean()
+
+    def test_cancel_during_unlimited_retry_preserves_source_and_existing_output(self):
+        self.failures = {0}
+        job = self.job(collision="overwrite", delete_source=True, retry_until_success=True)
+        self.output.mkdir()
+        job.destination.write_bytes(b"existing DNG")
+        cancel = threading.Event()
+        result = self.converter.convert(job, cancel, on_retry=lambda _data: cancel.set())
+        self.assertEqual(result.status, "cancelled")
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(job.destination.read_bytes(), b"existing DNG")
+        self.assertEqual(self.source.read_bytes(), b"original RAW")
+        self.assert_clean()
+
+    def test_size_failure_remains_terminal_with_unlimited_retry_enabled(self):
+        job = self.job(max_file_mb=0.001, retry_until_success=True)
+        result = self.converter.convert(job)
+        self.assertEqual(result.status, "error")
+        self.assertEqual(len(self.commands), 1)
+        self.assert_clean()
+
+    def test_cli_unlimited_retry_defaults_on_and_can_be_disabled(self):
+        parser = make_parser()
+        for flags, expected in (([], True), (["--no-auto-retry"], False)):
+            args = parser.parse_args(["convert", str(self.source), "--output", str(self.output), *flags])
+            self.assertEqual(_settings(args).retry_until_success, expected)
+
+    def test_size_adjustment_survives_a_cpu_control_error_like_the_reported_log(self):
+        self.sizes = [2000, 800, 800]
+        job = self.job(distance=0.2, effort=9, distance_step=0.05, max_distance=6,
+                       max_file_mb=0.001, oversize_action="increase-distance",
+                       cpu_limit=90, retry_until_success=True)
+        control = MagicMock(enabled=True, throttled_seconds=0)
+        with patch("raw_to_dng.core.ProcessControl", side_effect=[control, ProcessControlError("AccessDenied: (pid=6292)"), control]), \
+             patch("raw_to_dng.core.threading.Event.wait", return_value=False):
+            result = self.converter.convert(job)
+        self.assertEqual(result.status, "ok", result.message)
+        self.assertEqual(self.distances(), [0.2, 0.25, 0.25])
+        self.assertEqual(result.attempts[1].exit_code, 0)
+        self.assertEqual(result.attempts[1].error_type, "raw_to_dng.resources.ProcessControlError")
+        self.assertIn("AccessDenied", result.attempts[1].message)
+        self.assertEqual(result.output_bytes, 800)
+        self.assert_clean()
 
     def test_limit_disabled_preserves_single_conversion(self):
         job = self.job()
@@ -227,3 +298,4 @@ class SizeSettingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

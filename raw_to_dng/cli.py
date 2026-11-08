@@ -19,10 +19,13 @@ from .dng import inspect_dng
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("inputs", nargs="+", type=Path, help="RAW/DNGファイル、またはRAWフォルダー")
+    parser.add_argument("inputs", nargs="+", type=Path, help="RAW／DNG／JPEGファイル、またはフォルダー")
     parser.add_argument("--output", "-o", required=True, type=Path)
     parser.add_argument("--converter", type=Path, help="Adobe DNG Converterのexeまたはapp")
     parser.add_argument("--mode", choices=[mode.value for mode in Mode], default=Mode.LOSSY_JXL.value)
+    parser.add_argument("--force-jpeg-to-dng", action="store_true",
+                        help="JPEGを一時的にLinear DNGに変換し、--modeの設定で再変換")
+    parser.add_argument("--wb-kelvin", type=int, help="JPEG強制変換の初期WBをケルビンで指定。省略時はJPEGの色を基準にする")
     parser.add_argument("--distance", type=float, default=0.1, help="JPEG XL画質: 0〜6、小さいほど高画質")
     parser.add_argument("--effort", type=int, default=7)
     parser.add_argument("--max-file-mb", type=float, default=0, help="完成DNGの最大MB（1 MB＝1,000,000バイト、0＝制限なし）")
@@ -36,6 +39,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--priority", choices=("normal", "low", "idle"), default="normal", help="変換プロセスの優先度")
     parser.add_argument("--cpu-limit", type=int, default=100, help="全論理CPUに対する使用率上限の目安（1〜100%%）")
     parser.add_argument("--no-jxl-retry", action="store_true", help="該当assert時のeffort段階再試行（9→8→7）を無効化")
+    parser.add_argument("--no-auto-retry", action="store_true", help="変換エラー・時間超過時の無制限再試行を無効化")
     parser.add_argument("--jxl-fallback", action="store_true", help="該当assert時にロスレスJPEGへ変更（原寸指定時のみ）")
     resolution = parser.add_mutually_exclusive_group()
     resolution.add_argument("--megapixels", "--mp", type=float, help="上限MP。24は2400万画素")
@@ -48,7 +52,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--collision", choices=("rename", "skip", "overwrite"), default="rename")
     parser.add_argument("--name-template", default="{stem}")
     parser.add_argument("--start-index", type=int, default=1)
-    parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--timeout", type=float, default=1800, help="1試行の制限秒数。--no-auto-retry指定時は全試行の合計")
     parser.add_argument("--no-recursive", action="store_true")
     parser.add_argument("--flatten", action="store_true")
     parser.add_argument("--include-dng", action="store_true")
@@ -84,10 +88,12 @@ def _settings(args) -> Settings:
                       name_template=args.name_template, timeout_seconds=args.timeout,
                       strict_wb=not args.allow_missing_wb, preserve_mtime=not args.no_preserve_mtime,
                       jxl_retry=not args.no_jxl_retry, jxl_fallback=args.jxl_fallback,
+                      retry_until_success=not args.no_auto_retry,
                       priority=args.priority, cpu_limit=args.cpu_limit, parallel_jobs=args.jobs,
                       delete_source=args.delete_source, max_file_mb=args.max_file_mb,
                       oversize_action=args.oversize_action, distance_step=args.distance_step,
-                      max_distance=args.max_distance)
+                      max_distance=args.max_distance, jpeg_wb_kelvin=args.wb_kelvin,
+                      force_jpeg_to_dng=args.force_jpeg_to_dng)
     if args.speed:
         result = speed_settings(result)
     result.validate()
@@ -121,11 +127,16 @@ def main(argv: list[str] | None = None) -> int:
                               "lightroom_verified_here": False}, ensure_ascii=False, indent=2))
             return 0
         settings = _settings(args)
+        jpeg_only = settings.mode == Mode.JPEG_TO_DNG
+        if jpeg_only and args.command == "compare":
+            raise ValueError("JPEGモードはconvertコマンドで使用してください。")
         output = args.output.expanduser().resolve()
         exclude = output if not any(p.is_dir() and p.resolve() == output for p in args.inputs) else None
-        sources = scan_inputs(args.inputs, not args.no_recursive, args.include_dng, exclude)
+        sources = scan_inputs(args.inputs, not args.no_recursive, args.include_dng, exclude,
+                              jpeg_only=jpeg_only, include_jpeg=settings.force_jpeg_to_dng)
         if not sources:
-            raise ValueError("変換対象のRAWがありません。")
+            message = "変換対象のJPEGがありません。" if jpeg_only else "変換対象のファイルがありません。"
+            raise ValueError(message)
         if args.command == "compare":
             distances = list(dict.fromkeys(float(value.strip()) for value in args.distances.split(",")))
             if not 1 <= len(distances) <= 12:
@@ -142,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
                                "settings": job.settings.to_dict(), "adobe_flags": job.settings.adobe_flags()}
                               for job in jobs], ensure_ascii=False, indent=2))
             return 0
-        converter = Converter(resolve_converter(args.converter))
+        converter = Converter(None if jpeg_only else resolve_converter(args.converter))
         cancel = threading.Event()
         previous_handler = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, lambda *_args: cancel.set())
@@ -165,4 +176,5 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
 

@@ -25,6 +25,8 @@ class BatchProgress:
     total: int = 0
     planned: bool = False
     stopped: bool = False
+    succeeded: int = 0
+    errors: int = 0
     _pending_work: set[int] = field(default_factory=set)
     _finished: set[int] = field(default_factory=set)
     _seconds: float = 0.0
@@ -47,6 +49,7 @@ class BatchProgress:
         self.total, self.planned, self.stopped = len(flags), True, False
         self._pending_work = {i for i, needs_conversion in enumerate(flags) if needs_conversion}
         self._finished.clear()
+        self.succeeded = self.errors = 0
         self._seconds, self._samples, self._parallel_jobs = 0.0, 0, parallel_jobs
         self._active.clear()
 
@@ -58,6 +61,8 @@ class BatchProgress:
         if not 0 <= index < self.total or index in self._finished:
             return
         self._finished.add(index)
+        self.succeeded += status == "ok"
+        self.errors += status == "error"
         self._pending_work.discard(index)
         self._active.pop(index, None)
         if attempted and status not in ("skipped", "cancelled") and elapsed > 0 and math.isfinite(elapsed):
@@ -87,3 +92,4 @@ class BatchProgress:
             return "全数 — / 残件数 — / 残り時間 —"
         eta = "中止" if self.stopped else format_remaining(self.estimate(now))
         return f"全数 {self.total}件 / 残件数 {self.remaining}件 / 残り時間 {eta}"
+

@@ -99,8 +99,12 @@ class Application:
         self.max_distance = tk.StringVar(value="6")
         self.jxl_retry = tk.BooleanVar(value=True)
         self.jxl_fallback = tk.BooleanVar(value=False)
+        self.retry_until_success = tk.BooleanVar(value=True)
+        self.result_counts = tk.StringVar(value="成功 0件 / エラー 0件")
         self.hint = tk.StringVar()
-        self.status = tk.StringVar(value="RAWを追加し、出力先を選択してください。")
+        self.force_jpeg_to_dng = tk.BooleanVar(value=False)
+        self.jpeg_wb_kelvin = tk.StringVar(value="")
+        self.status = tk.StringVar(value="入力ファイルを追加し、出力先を選択してください。")
         self.progress_summary = tk.StringVar(value=self.batch_progress.summary(time.monotonic()))
         self._style()
         self._load_settings()
@@ -159,7 +163,7 @@ class Application:
         outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="DngConverterEx", style="Title.TLabel", font=(self.font_family, 21, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="AdobeのRAW変換を、画質と画素数を指定して一括処理。", style="Muted.TLabel").pack(anchor="w", pady=(2, 10))
+        ttk.Label(outer, text="RAW・JPEGを一括でDNGに変換。", style="Muted.TLabel").pack(anchor="w", pady=(2, 10))
 
         engine = ttk.Frame(outer)
         engine.pack(fill="x", pady=(0, 10))
@@ -180,7 +184,7 @@ class Application:
         main.columnconfigure(0, weight=1)
         main.columnconfigure(1, weight=0)
 
-        inputs = ttk.LabelFrame(main, text="入力 RAW / DNG", padding=10)
+        inputs = ttk.LabelFrame(main, text="入力 RAW / DNG / JPEG", padding=10)
         inputs.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         bar = ttk.Frame(inputs)
         bar.pack(fill="x", pady=(0, 6))
@@ -222,7 +226,8 @@ class Application:
         settings.grid(row=0, column=1, sticky="nsew")
         settings.columnconfigure(1, weight=1)
         ttk.Label(settings, text="圧縮方式").grid(row=0, column=0, sticky="w", pady=5)
-        self.mode_widget = self._combo(settings, self.mode, MODE_LABELS.values(), 39)
+        final_modes = [label for mode, label in MODE_LABELS.items() if mode != Mode.JPEG_TO_DNG]
+        self.mode_widget = self._combo(settings, self.mode, final_modes, 39)
         self.mode_widget.grid(row=0, column=1, columnspan=3, sticky="ew", pady=5)
         self.mode_widget.bind("<<ComboboxSelected>>", self._settings_changed)
         ttk.Label(settings, text="圧縮画質").grid(row=1, column=0, sticky="w", pady=5)
@@ -248,6 +253,13 @@ class Application:
         self.side_widget.grid(row=5, column=1, sticky="w", pady=5)
         ttk.Label(settings, text="px").grid(row=5, column=2, sticky="w")
         ttk.Label(settings, text="縦横比を維持。指定値は上限、拡大はしません。", style="Muted.TLabel").grid(row=6, column=0, columnspan=4, sticky="w", pady=4)
+        jpeg_check = self._check(settings, "JPEGをDNGに強制変換", self.force_jpeg_to_dng)
+        jpeg_check.configure(command=self._settings_changed)
+        jpeg_check.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(settings, text="JPEGの初期WB").grid(row=8, column=0, sticky="w", pady=5)
+        self.jpeg_wb_widget = self._entry(settings, self.jpeg_wb_kelvin, width=12)
+        self.jpeg_wb_widget.grid(row=8, column=1, sticky="w", pady=5)
+        ttk.Label(settings, text="K（空欄はJPEGの色を基準）").grid(row=8, column=2, columnspan=2, sticky="w")
 
         output = ttk.Frame(main)
         output.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -285,7 +297,7 @@ class Application:
                 self.collision_widget = widget
         for row, (text, variable) in enumerate((("JPEG XL effort（1＝高速、9＝低速）", self.effort),
                                                ("出力名（.dngは自動付加）", self.name_template),
-                                               ("開始番号", self.start_index), ("1ファイルの制限時間（秒）", self.timeout)), 3):
+                                               ("開始番号", self.start_index), ("1試行の制限時間（秒）", self.timeout)), 3):
             ttk.Label(advanced, text=text).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=3)
             widget = self._entry(advanced, variable, width=28)
             widget.grid(row=row, column=1, sticky="w", pady=3)
@@ -314,8 +326,10 @@ class Application:
         ttk.Label(resources, text="%").pack(side="left")
         ttk.Label(resources, text="並列処理全体の上限。100%＝制限なし。", style="Muted.TLabel").pack(side="left", padx=(16, 0))
 
-        recovery = ttk.LabelFrame(advanced, text="JPEG XLのエラー対策", padding=8)
+        recovery = ttk.LabelFrame(advanced, text="変換エラー対策", padding=8)
         recovery.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        retry_widget = self._check(recovery, "変換・CPU制御エラー・時間超過は成功するまで再試行（回数無制限・中止可能）", self.retry_until_success)
+        retry_widget.grid(row=3, column=0, columnspan=2, sticky="w", pady=3)
         self.jxl_retry_widget = self._check(recovery, "該当するassert時、effortを1ずつ下げて再試行（9→8→7。画質設定・解像度は維持）", self.jxl_retry)
         self.jxl_retry_widget.grid(row=0, column=0, columnspan=2, sticky="w", pady=3)
         self.jxl_fallback_widget = self._check(recovery, "該当assertで失敗したら、ロスレスJPEG圧縮DNGへ変更（原寸指定時のみ）", self.jxl_fallback)
@@ -328,9 +342,12 @@ class Application:
         action.pack(fill="x", pady=12)
         self.start_button = self._button(action, "変換を開始", lambda: self._start(False), style="Accent.TButton")
         self.start_button.pack(side="left")
-        self._button(action, "選択RAWの画質を比較", lambda: self._start(True)).pack(side="left", padx=8)
+        self.compare_button = self._button(action, "選択画像の画質を比較", lambda: self._start(True))
+        self.compare_button.pack(side="left", padx=8)
         self.cancel_button = ttk.Button(action, text="中止", command=self._cancel, state="disabled")
         self.cancel_button.pack(side="left")
+        self.result_counts_widget = ttk.Label(action, textvariable=self.result_counts)
+        self.result_counts_widget.pack(side="left", padx=(12, 0))
         ttk.Button(action, text="出力先を開く", command=self._open_output).pack(side="right")
         ttk.Button(action, text="使い方", command=self._help).pack(side="right", padx=8)
         ttk.Button(action, text="画質ガイド / F1", command=self._show_guide).pack(side="right")
@@ -369,15 +386,15 @@ class Application:
             if path not in self.inputs:
                 self.inputs.append(path)
                 self.input_tree.insert("", "end", iid=str(path), values=(str(path),))
-        self.status.set(f"入力 {len(self.inputs)} 件。フォルダー内のRAWは開始時に展開します。")
+        self.status.set(f"入力 {len(self.inputs)} 件。フォルダー内のファイルは開始時に走査します。")
 
     def _choose_files(self) -> None:
         # Case-insensitive wildcard behavior differs between Tk/platforms; include all.
-        paths = filedialog.askopenfilenames(title="RAW / DNGを追加", filetypes=(("すべてのファイル", "*"),))
+        paths = filedialog.askopenfilenames(title="RAW / DNG / JPEGを追加", filetypes=(("すべてのファイル", "*"),))
         self._add_paths(paths)
 
     def _choose_folder(self) -> None:
-        path = filedialog.askdirectory(title="RAWが入ったフォルダー")
+        path = filedialog.askdirectory(title="画像が入ったフォルダー")
         if path:
             self._add_paths([path])
 
@@ -429,9 +446,11 @@ class Application:
     def _settings_changed(self, _event=None) -> None:
         mode = self._selected_mode()
         jxl = mode == Mode.LOSSY_JXL
+        force_jpeg = self.force_jpeg_to_dng.get()
         if hasattr(self, "quality_widget"):
             if not jxl:
                 self.oversize_action.set(OVERSIZE_ACTION_LABELS["fail"])
+            self.jpeg_wb_widget.configure(state="normal" if force_jpeg and not self.busy else "disabled")
             self.oversize_action_widget.configure(state="readonly" if jxl and not self.busy else "disabled")
             adjust_size = jxl and self.oversize_action.get() == OVERSIZE_ACTION_LABELS["increase-distance"] and not self.busy
             self.distance_step_widget.configure(state="normal" if adjust_size else "disabled")
@@ -455,6 +474,8 @@ class Application:
             self.hint.set("原寸のRAW情報を優先するモードです。縮小する場合は画質指定JPEG XLを選択してください。")
             if mode == Mode.LOSSLESS_JXL:
                 self.hint.set(self.hint.get() + " このモードではGUIのeffort指定は適用されません。")
+        if force_jpeg:
+            self.hint.set("JPEGは中間DNGを作り、選択した圧縮・解像度設定で再変換します。 " + self.hint.get())
 
     def _prefer_effort7(self) -> None:
         self.effort.set("7")
@@ -470,8 +491,15 @@ class Application:
         self.status.set("速度優先：effort 7 / 優先度 通常 / CPU 100% / 並列2。画質指定・解像度は維持。並列数は実測で比較してください。")
 
     def _collect_settings(self) -> Settings:
+        mode = self._selected_mode()
+        force_jpeg = self.force_jpeg_to_dng.get()
+        wb_text = self.jpeg_wb_kelvin.get().strip() if force_jpeg else ""
+        try:
+            wb_kelvin = int(wb_text) if wb_text else None
+        except ValueError as exc:
+            raise ValueError("JPEGの初期WBはケルビン値の整数で入力してください。") from exc
         settings = Settings(
-            mode=self._selected_mode(), distance=float(self.distance.get()), effort=int(self.effort.get()),
+            mode=mode, distance=float(self.distance.get()), effort=int(self.effort.get()),
             megapixels=float(self.megapixels.get()) if self.resize.get() == "画素数で指定（MP）" else None,
             long_edge=int(self.long_edge.get()) if self.resize.get() == "長辺で指定（px）" else None,
             preview={"なし": 0, "中サイズ": 1, "全画素": 2}[self.preview.get()],
@@ -481,9 +509,11 @@ class Application:
             name_template=self.name_template.get(), timeout_seconds=float(self.timeout.get()),
             strict_wb=self.strict_wb.get(), preserve_mtime=self.preserve_mtime.get(),
             jxl_retry=self.jxl_retry.get(), jxl_fallback=self.jxl_fallback.get(),
+            retry_until_success=self.retry_until_success.get(),
             priority=next(key for key, label in PRIORITY_LABELS.items() if label == self.priority.get()),
             cpu_limit=int(self.cpu_limit.get()), parallel_jobs=int(self.parallel_jobs.get()),
             delete_source=self.delete_source.get(),
+            jpeg_wb_kelvin=wb_kelvin, force_jpeg_to_dng=force_jpeg,
             max_file_mb=float(self.max_file_mb.get()),
             oversize_action=next(key for key, label in OVERSIZE_ACTION_LABELS.items() if label == self.oversize_action.get()),
             distance_step=float(self.distance_step.get()), max_distance=float(self.max_distance.get()),
@@ -505,7 +535,7 @@ class Application:
             settings = self._collect_settings()
             converter = Converter(resolve_converter(self.converter.get().strip() or None))
             if not self.inputs:
-                raise ValueError("入力RAWまたはフォルダーを追加してください。")
+                raise ValueError("入力ファイルまたはフォルダーを追加してください。")
             if not self.output.get().strip():
                 raise ValueError("出力先フォルダーを指定してください。")
             output = Path(self.output.get()).expanduser().resolve()
@@ -514,7 +544,7 @@ class Application:
             if compare:
                 selected = self.input_tree.selection()
                 if len(selected) != 1 or not Path(selected[0]).is_file():
-                    raise ValueError("入力一覧で比較用のRAWファイルを1つ選択してください。")
+                    raise ValueError("入力一覧で比較用の画像ファイルを1つ選択してください。")
                 inputs = [Path(selected[0])]
                 value = simpledialog.askstring("圧縮画質を比較", "distanceをカンマで区切って指定\n小さいほど高画質。MP／長辺指定も各出力に適用します。", initialvalue="0.1,0.3,0.5", parent=self.root)
                 if value is None:
@@ -540,19 +570,21 @@ class Application:
             self.progress.configure(mode="indeterminate")
             self.progress.start(15)
             self.batch_progress = BatchProgress()
+            self.result_counts.set("成功 0件 / エラー 0件")
             self.progress_summary.set("全数 走査中 / 残件数 — / 残り時間 —")
-            self.status.set("入力RAWを走査しています…")
+            self.status.set("入力ファイルを走査しています…")
 
             def worker() -> None:
                 try:
                     # If output equals an input directory, do not exclude that entire input.
                     exclude = output if not any(p.is_dir() and p.resolve() == output for p in inputs) else None
-                    sources = scan_inputs(inputs, recursive, include_dng, exclude, self.cancel)
+                    sources = scan_inputs(inputs, recursive, include_dng, exclude, self.cancel,
+                                          include_jpeg=settings.force_jpeg_to_dng)
                     if self.cancel.is_set():
                         self.events.put(("aborted", {"message": "走査を中止しました。"}))
                         return
                     if not sources:
-                        raise ValueError("変換対象のRAWがありません。DNGは直接追加するか、DNGも対象の設定を有効にしてください。")
+                        raise ValueError("変換対象がありません。JPEGの強制変換やDNGの対象設定を確認してください。")
                     if distances is None:
                         jobs = plan_jobs(sources, output, settings, preserve_folders, start_index)
                     else:
@@ -629,6 +661,7 @@ class Application:
                         messagebox.showerror("変換処理", data["message"], parent=self.root)
         except queue.Empty:
             pass
+        self.result_counts.set(f"成功 {self.batch_progress.succeeded}件 / エラー {self.batch_progress.errors}件")
         if self.batch_progress.planned:
             self.progress_summary.set(self.batch_progress.summary(time.monotonic()))
         elif not self.busy:
@@ -679,6 +712,11 @@ class Application:
                     getattr(self, name).set(data[name])
             if self.mode.get() not in MODE_LABELS.values():
                 self.mode.set(MODE_LABELS[Mode.LOSSY_JXL])
+            elif self.mode.get() == MODE_LABELS[Mode.JPEG_TO_DNG]:
+                self.force_jpeg_to_dng.set(True)
+                self.mode.set(MODE_LABELS[Mode.UNCOMPRESSED])
+                self.resize.set("原寸を維持")
+                self.delete_source.set(False)
             if self.collision.get() == "スキップ":
                 # Migrate preferences saved before the dedicated checkbox existed.
                 self.skip_existing.set(True)
@@ -700,8 +738,8 @@ class Application:
         return ("converter", "output", "mode", "quality", "distance", "effort", "resize", "megapixels", "long_edge", "preview",
                 "compatibility", "collision", "name_template", "start_index", "timeout", "recursive", "preserve_folders",
                 "include_dng", "fast_load", "embed_original", "linear", "strict_wb", "preserve_mtime",
-                "skip_existing", "jxl_retry", "jxl_fallback", "priority", "cpu_limit", "parallel_jobs", "delete_source",
-                "max_file_mb", "oversize_action", "distance_step", "max_distance")
+                "skip_existing", "jxl_retry", "jxl_fallback", "retry_until_success", "priority", "cpu_limit", "parallel_jobs", "delete_source",
+                "max_file_mb", "oversize_action", "distance_step", "max_distance", "jpeg_wb_kelvin", "force_jpeg_to_dng")
 
     def _save_settings(self) -> None:
         try:
@@ -741,4 +779,5 @@ def launch(initial_inputs: list[str] | None = None) -> None:
     root = tk.Tk()
     Application(root, initial_inputs)
     root.mainloop()
+
 

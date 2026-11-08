@@ -24,11 +24,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import __version__
-from .resources import PRIORITY_LABELS, CpuBudget, ProcessControl
+from .resources import PRIORITY_LABELS, CpuBudget, ProcessControl, ProcessControlError
 from .dng import DngError, DngInfo, inspect_dng
+from .jpeg_dng import MAX_WB_KELVIN, MIN_WB_KELVIN, preserve_jpeg_thumbnail, write_jpeg_dng
 
 
 RAW_EXTENSIONS = frozenset(".3fr .arw .bay .cap .cr2 .cr3 .crw .dcs .dcr .drf .eip .erf .fff .iiq .k25 .kdc .mdc .mef .mos .mrw .nef .nrw .obm .orf .pef .ptx .pxn .r3d .raf .raw .rw2 .rwl .sr2 .srf .srw .sti .tif .tiff .x3f".split())
+JPEG_EXTENSIONS = frozenset({".jpg", ".jpeg", ".jpe"})
 ADOBE_DOWNLOAD_URL = "https://helpx.adobe.com/camera-raw/desktop/dng-and-file-formats/adobe-dng-converter.html"
 COMPATIBILITIES = ("2.4", "4.1", "4.6", "5.4", "6.6", "7.1", "11.2", "12.4", "13.2", "14.0", "15.3")
 MAX_PARALLEL_JOBS = 32
@@ -53,6 +55,10 @@ class OutputTooLarge(ConversionError):
                          f"> {limit_bytes / 1_000_000:.6f} MB。出力を破棄しました。")
 
 
+class ConversionTimeout(ConversionError):
+    """An Adobe attempt exceeded its time budget."""
+
+
 class AdobeProcessError(ConversionError):
     """A nonzero Adobe exit, distinct from validation/cancellation failures."""
 
@@ -73,6 +79,7 @@ class Mode(str, Enum):
     LOSSLESS_JXL = "lossless-jxl"
     LOSSY_JPEG = "lossy-jpeg"
     UNCOMPRESSED = "uncompressed"
+    JPEG_TO_DNG = "jpeg-to-dng"
 
 
 MODE_LABELS = {
@@ -81,6 +88,7 @@ MODE_LABELS = {
     Mode.LOSSLESS_JXL: "RAW保持優先：ロスレスJPEG XL圧縮DNG",
     Mode.LOSSY_JPEG: "旧版互換：非可逆JPEG圧縮DNG（画質固定）",
     Mode.UNCOMPRESSED: "無圧縮DNG",
+    Mode.JPEG_TO_DNG: "JPEGをDNGに強制変換（16bit Linear）",
 }
 
 
@@ -103,6 +111,7 @@ class Settings:
     preserve_mtime: bool = True
     jxl_retry: bool = True
     jxl_fallback: bool = False
+    retry_until_success: bool = True
     priority: str = "normal"
     cpu_limit: int = 100
     parallel_jobs: int = 1
@@ -111,6 +120,8 @@ class Settings:
     oversize_action: str = "fail"
     distance_step: float = 0.1
     max_distance: float = 6.0
+    jpeg_wb_kelvin: int | None = None
+    force_jpeg_to_dng: bool = False
 
     @property
     def max_file_bytes(self) -> int | None:
@@ -122,8 +133,21 @@ class Settings:
         return round(self.megapixels * 1_000_000) if self.megapixels is not None else None
 
     def validate(self) -> None:
+        if type(self.retry_until_success) is not bool:
+            raise ValueError("成功するまでの再試行はON/OFFで指定してください。")
         if not isinstance(self.mode, Mode):
             raise ValueError("圧縮方式が不正です。")
+        if type(self.force_jpeg_to_dng) is not bool:
+            raise ValueError("JPEG強制変換はON/OFFで指定してください。")
+        if self.mode == Mode.JPEG_TO_DNG and self.force_jpeg_to_dng:
+            raise ValueError("JPEGの再変換では、最終DNGの圧縮方式を指定してください。")
+        if self.mode == Mode.JPEG_TO_DNG and (self.delete_source or self.embed_original):
+            raise ValueError("JPEGモードでは元のJPEGを別ファイルとして保存します。")
+        if self.jpeg_wb_kelvin is not None:
+            if self.mode != Mode.JPEG_TO_DNG and not self.force_jpeg_to_dng:
+                raise ValueError("WBのケルビン指定はJPEG強制変換モード用です。")
+            if type(self.jpeg_wb_kelvin) is not int or not MIN_WB_KELVIN <= self.jpeg_wb_kelvin <= MAX_WB_KELVIN:
+                raise ValueError(f"WBは{MIN_WB_KELVIN}〜{MAX_WB_KELVIN} Kの整数で指定してください。")
         if self.priority not in PRIORITY_LABELS:
             raise ValueError("プロセス優先度が不正です。")
         if type(self.cpu_limit) is not int or not 1 <= self.cpu_limit <= 100:
@@ -192,6 +216,8 @@ class Settings:
 
     def adobe_flags(self) -> list[str]:
         self.validate()
+        if self.mode == Mode.JPEG_TO_DNG:
+            return []
         flags: list[str] = []
         if self.mode == Mode.LOSSY_JXL:
             flags += ["-dng1.7", "-lossy", "-jxl", "-jxl_distance", format(self.distance, ".15g"), "-jxl_effort", str(self.effort)]
@@ -218,7 +244,7 @@ class Settings:
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["mode"] = self.mode.value
-        result["adobe_pixel_limit"] = self.pixel_limit
+        result["adobe_pixel_limit"] = self.pixel_limit if self.mode != Mode.JPEG_TO_DNG else None
         result["adobe_jxl_effort"] = self.effort if self.mode == Mode.LOSSY_JXL else None
         result["adobe_jxl_distance"] = self.distance if self.mode == Mode.LOSSY_JXL else None
         result["max_file_bytes"] = self.max_file_bytes
@@ -308,16 +334,25 @@ class Source:
 
 
 def scan_inputs(inputs: Iterable[str | Path], recursive: bool = True, include_dng: bool = False,
-                exclude_directory: Path | None = None, cancel: threading.Event | None = None) -> list[Source]:
+                exclude_directory: Path | None = None, cancel: threading.Event | None = None,
+                *, jpeg_only: bool = False, include_jpeg: bool = False) -> list[Source]:
     sources: list[Source] = []
     seen: set[Path] = set()
     accepted = RAW_EXTENSIONS | ({".dng"} if include_dng else set())
+    if jpeg_only:
+        accepted = JPEG_EXTENSIONS
+    elif include_jpeg:
+        accepted |= JPEG_EXTENSIONS
     excluded = exclude_directory.resolve() if exclude_directory else None
     for value in inputs:
         if cancel and cancel.is_set():
             break
         root = Path(value).expanduser().resolve()
         if root.is_file():
+            if jpeg_only and root.suffix.lower() not in JPEG_EXTENSIONS:
+                raise ValueError(f"JPEGモードの対象はJPG／JPEG／JPEです: {root.name}")
+            if not (jpeg_only or include_jpeg) and root.suffix.lower() in JPEG_EXTENSIONS:
+                raise ValueError(f"JPEGを変換するには「JPEGをDNGに強制変換」を選択してください: {root.name}")
             # Explicitly chosen inputs may be TIFF RAW or have any extension.
             # Adobe and the output validator determine whether conversion works.
             if root not in seen:
@@ -383,10 +418,12 @@ def verify_output(info: DngInfo, settings: Settings) -> None:
     expected = {
         Mode.LOSSY_JXL: {52546}, Mode.LOSSLESS_JXL: {52546},
         Mode.LOSSY_JPEG: {34892}, Mode.LOSSLESS_JPEG: {7, 8, 32946},
-        Mode.UNCOMPRESSED: {1},
+        Mode.UNCOMPRESSED: {1}, Mode.JPEG_TO_DNG: {1},
     }[settings.mode]
     if info.compression not in expected:
         raise ConversionError(f"指定した圧縮方式と出力が一致しません: {info.compression_name}。旧版Converterが指定を無視した可能性があります。")
+    if settings.mode == Mode.JPEG_TO_DNG and (info.raw_kind != "Linear RAW" or info.bits_per_sample != (16, 16, 16)):
+        raise ConversionError("JPEGから16bit RGBのLinear DNGを生成できませんでした。")
     if settings.mode == Mode.LOSSY_JXL and (info.raw_kind != "Linear RAW" or min(info.bits_per_sample) < 16):
         raise ConversionError("画質指定JPEG XLが16bit以上のLinear RAWとして出力されませんでした。")
     if settings.mode in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL):
@@ -465,6 +502,7 @@ class Attempt:
     elapsed_seconds: float = 0.0
     cpu_throttle_seconds: float = 0.0
     output_bytes: int = 0
+    error_type: str = ""
 
 
 @dataclass
@@ -483,6 +521,7 @@ class Result:
     attempts: list[Attempt] = field(default_factory=list)
     source_delete_status: str = "disabled"
     source_delete_message: str = ""
+    error_type: str = ""
     _source_identity: tuple[int, int, int, int] | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -517,9 +556,9 @@ def _delete_source(results: list[Result]) -> None:
 
 
 class Converter:
-    def __init__(self, executable: str | Path):
-        self.executable = resolve_converter(executable)
-        self.version = converter_version(self.executable)
+    def __init__(self, executable: str | Path | None):
+        self.executable = resolve_converter(executable) if executable is not None else None
+        self.version = converter_version(self.executable) if self.executable is not None else None
 
     @staticmethod
     def _stop(process: subprocess.Popen) -> None:
@@ -537,7 +576,7 @@ class Converter:
         if cancel.is_set():
             raise Cancelled("変換を中止しました。")
         if time.monotonic() - started >= timeout:
-            raise ConversionError(f"タイムアウト（{timeout:g}秒。再試行を含む）。")
+            raise ConversionTimeout(f"タイムアウト（{timeout:g}秒）。")
 
     @staticmethod
     def _check_source(job: Job, source_stat: os.stat_result) -> None:
@@ -559,46 +598,73 @@ class Converter:
             # Adobe run may leave a partial DNG that must never be reused.
             with tempfile.TemporaryDirectory(prefix=".raw-to-dng-", dir=job.destination.parent) as temporary:
                 stage = Path(temporary) / "converted.dng"
-                attempt.command = [str(self.executable), *settings.adobe_flags(), "-d", temporary,
-                                   "-o", stage.name, str(job.source.path)]
-                result.command = attempt.command.copy()
-                with tempfile.TemporaryFile() as log:
-                    kwargs: dict[str, Any] = {}
-                    if os.name == "nt":
-                        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                    process = None
-                    try:
-                        process = subprocess.Popen(attempt.command, stdout=log, stderr=subprocess.STDOUT,
-                                                   stdin=subprocess.DEVNULL, shell=False, **kwargs)
-                        control = ProcessControl(process.pid, settings.priority, settings.cpu_limit, budget=cpu_budget)
+                prepare_jpeg = settings.force_jpeg_to_dng and job.source.path.suffix.lower() in JPEG_EXTENSIONS
+                if settings.mode == Mode.JPEG_TO_DNG:
+                    write_jpeg_dng(job.source.path, stage,
+                                   lambda: self._check_running(cancel, started, job.settings.timeout_seconds),
+                                   wb_kelvin=settings.jpeg_wb_kelvin)
+                else:
+                    if self.executable is None:
+                        raise ConversionError("最終DNGの変換にはAdobe DNG Converterが必要です。")
+                    adobe_source = job.source.path
+                    if prepare_jpeg:
+                        input_directory = Path(temporary) / "input"
+                        input_directory.mkdir()
+                        adobe_source = input_directory / job.source.path.with_suffix(".dng").name
+                        thumbnail = write_jpeg_dng(
+                            job.source.path, adobe_source,
+                            lambda: self._check_running(cancel, started, job.settings.timeout_seconds),
+                            wb_kelvin=settings.jpeg_wb_kelvin,
+                        )
+                        self._check_running(cancel, started, job.settings.timeout_seconds)
+                        self._check_source(job, source_stat)
+                    attempt.command = [str(self.executable), *settings.adobe_flags(), "-d", temporary,
+                                       "-o", stage.name, str(adobe_source)]
+                    result.command = attempt.command.copy()
+                    with tempfile.TemporaryFile() as log:
+                        kwargs: dict[str, Any] = {}
+                        if os.name == "nt":
+                            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                        process = None
                         try:
-                            with control:
-                                if (settings.priority != "normal" or settings.cpu_limit < 100) and not control.enabled and process.poll() is None:
-                                    raise ConversionError("変換プロセスのCPU・優先度を制御できませんでした。")
-                                while process.poll() is None:
-                                    cancel.wait(0.15)
-                                    self._check_running(cancel, started, job.settings.timeout_seconds)
-                                    control.update(cancel, lambda: self._check_running(cancel, started, job.settings.timeout_seconds))
+                            process = subprocess.Popen(attempt.command, stdout=log, stderr=subprocess.STDOUT,
+                                                       stdin=subprocess.DEVNULL, shell=False, **kwargs)
+                            control = ProcessControl(process.pid, settings.priority, settings.cpu_limit, budget=cpu_budget,
+                                                     has_exited=lambda: process.poll() is not None)
+                            try:
+                                with control:
+                                    if (settings.priority != "normal" or settings.cpu_limit < 100) and not control.enabled and process.poll() is None:
+                                        raise ConversionError("変換プロセスのCPU・優先度を制御できませんでした。")
+                                    while process.poll() is None:
+                                        cancel.wait(0.15)
+                                        self._check_running(cancel, started, job.settings.timeout_seconds)
+                                        if process.poll() is not None:
+                                            break
+                                        control.update(cancel, lambda: self._check_running(cancel, started, job.settings.timeout_seconds))
+                            finally:
+                                attempt.cpu_throttle_seconds = round(control.throttled_seconds, 3)
+                        except BaseException:
+                            if process is not None:
+                                self._stop(process)
+                            raise
                         finally:
-                            attempt.cpu_throttle_seconds = round(control.throttled_seconds, 3)
-                    except BaseException:
-                        if process is not None:
-                            self._stop(process)
-                        raise
-                    finally:
-                        if process is not None:
-                            attempt.exit_code = process.returncode
-                        log.seek(0, os.SEEK_END)
-                        log.seek(max(0, log.tell() - 16000))
-                        attempt.log = log.read().decode("utf-8", "replace").strip()
-                self._check_running(cancel, started, job.settings.timeout_seconds)
-                if attempt.exit_code:
-                    raise AdobeProcessError(attempt.exit_code, attempt.log)
-                if not stage.is_file():
-                    raise ConversionError("AdobeがDNGを生成しませんでした。未対応機種・RAW破損・変換指定を確認してください。\n" + attempt.log)
+                            if process is not None:
+                                attempt.exit_code = process.returncode
+                            log.seek(0, os.SEEK_END)
+                            log.seek(max(0, log.tell() - 16000))
+                            attempt.log = log.read().decode("utf-8", "replace").strip()
+                    self._check_running(cancel, started, job.settings.timeout_seconds)
+                    if attempt.exit_code:
+                        raise AdobeProcessError(attempt.exit_code, attempt.log)
+                    if not stage.is_file():
+                        raise ConversionError("AdobeがDNGを生成しませんでした。未対応機種・RAW破損・変換指定を確認してください。\n" + attempt.log)
+                    if prepare_jpeg and settings.jpeg_wb_kelvin is None:
+                        preserve_jpeg_thumbnail(stage, thumbnail)
                 self._check_source(job, source_stat)
                 info = inspect_dng(stage)
                 verify_output(info, settings)
+                if prepare_jpeg and info.raw_kind != "Linear RAW":
+                    raise ConversionError("JPEGからの再変換結果がLinear DNGではありません。")
                 attempt.output_bytes = stage.stat().st_size
                 # Measure the complete DNG, including previews, metadata and
                 # embedded RAW, before publication or deleting any source.
@@ -619,6 +685,10 @@ class Converter:
                     result.dng["path"] = str(final)
                     result.effective_settings = settings.to_dict()
                     result.message = f"{info.width}×{info.height} / {info.megapixels:.2f} MP / {info.compression_name}"
+                    if prepare_jpeg and settings.jpeg_wb_kelvin is None and info.colorimetric_reference != 1:
+                        warning = "Adobeの出力にJPEGの階調を維持する現像済みフラグがありません。"
+                        result.dng["warnings"] += (warning,)
+                        result.message += " / " + warning
                     if settings.mode != job.settings.mode:
                         result.message += " / JPEG XL失敗 → ロスレスJPEGで成功（原寸）"
                     elif settings.effort != job.settings.effort:
@@ -631,7 +701,8 @@ class Converter:
             attempt.status, attempt.message = "cancelled", str(exc)
             raise
         except Exception as exc:
-            attempt.status, attempt.message = "error", str(exc)
+            attempt.error_type = f"{type(exc).__module__}.{type(exc).__name__}"
+            attempt.status, attempt.message = "error", str(exc) if isinstance(exc, ConversionError) else f"{attempt.error_type}: {exc}"
             raise
         finally:
             attempt.elapsed_seconds = round(time.monotonic() - attempt_started, 3)
@@ -664,12 +735,12 @@ class Converter:
                 return result
             job.destination.parent.mkdir(parents=True, exist_ok=True)
             reason = "初回"
-            # Each iteration increases distance, decreases effort, or switches
-            # once to lossless JPEG. Cancellation and one shared timeout bound
-            # the entire job; every attempt reconverts the original source.
+            # Unlimited retries get a fresh per-attempt timeout. Every attempt
+            # reconverts the original source and remains cancellable.
             while True:
                 try:
-                    self._attempt(job, settings, cancel, started, source_stat, result, reason, cpu_budget, reserved)
+                    attempt_start = time.monotonic() if settings.retry_until_success else started
+                    self._attempt(job, settings, cancel, attempt_start, source_stat, result, reason, cpu_budget, reserved)
                     break
                 except OutputTooLarge as exc:
                     if settings.oversize_action != "increase-distance" or settings.mode != Mode.LOSSY_JXL:
@@ -681,21 +752,33 @@ class Converter:
                     reason = f"サイズ超過: distance {settings.distance:g}→{next_distance:g}で再試行"
                     settings = replace(settings, distance=next_distance)
                 except AdobeProcessError as exc:
-                    if settings.mode not in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL) or not is_jxl_histogram_assert(exc.output):
-                        raise
-                    if settings.mode == Mode.LOSSY_JXL and settings.jxl_retry and settings.effort > 7:
+                    histogram_assert = (settings.mode in (Mode.LOSSY_JXL, Mode.LOSSLESS_JXL)
+                                        and is_jxl_histogram_assert(exc.output))
+                    if histogram_assert and settings.mode == Mode.LOSSY_JXL and settings.jxl_retry and settings.effort > 7:
                         next_effort = settings.effort - 1
                         reason = f"effort {settings.effort}→{next_effort}で再試行"
                         settings = replace(settings, effort=next_effort)
-                    elif settings.jxl_fallback:
+                    elif histogram_assert and settings.jxl_fallback:
                         reason = "ロスレスJPEGへ変更（原寸）"
                         settings = replace(settings, mode=Mode.LOSSLESS_JPEG, jxl_retry=False, jxl_fallback=False,
                                            oversize_action="fail")
+                    elif settings.retry_until_success:
+                        reason = f"Adobe変換エラー exit={exc.exit_code}。同じ設定で再試行"
                     else:
                         raise
+                except ConversionTimeout:
+                    if not settings.retry_until_success or settings.mode == Mode.JPEG_TO_DNG:
+                        raise
+                    reason = "制限時間超過。同じ設定で再試行"
+                except ProcessControlError as exc:
+                    if not settings.retry_until_success:
+                        raise
+                    reason = f"{exc}。同じ設定で再試行"
                 if on_retry:
                     on_retry({"attempt": len(result.attempts) + 1, "message": reason,
                               "settings": settings.to_dict()})
+                if settings.retry_until_success and cancel.wait(1.0):
+                    raise Cancelled("再試行待機中に中止しました。")
             if result.status == "ok" and settings.delete_source:
                 if defer_source_delete:
                     result.source_delete_status = "pending"
@@ -705,7 +788,8 @@ class Converter:
             result.status, result.message = "cancelled", str(exc)
         except Exception as exc:
             # One unusual file must not terminate the remaining batch or the GUI.
-            result.status, result.message = "error", str(exc)
+            result.error_type = f"{type(exc).__module__}.{type(exc).__name__}"
+            result.status, result.message = "error", str(exc) if isinstance(exc, ConversionError) else f"{result.error_type}: {exc}"
             if len(result.attempts) > 1:
                 result.message = f"再試行を含む{len(result.attempts)}回の変換に失敗しました。\n" + result.message
         finally:
@@ -829,4 +913,5 @@ def run_batch(converter: Converter, jobs: list[Job], report_directory: str | Pat
         record(summary)
         event("done", summary)
     return results, report_path
+
 

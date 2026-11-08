@@ -17,10 +17,10 @@ class DngError(ValueError):
 
 # Only decode metadata needed for verification, never RAW/XMP/private payloads.
 INTERESTING = {
-    254, 256, 257, 258, 259, 262, 271, 272, 273, 277, 279, 322, 323,
-    324, 325, 330, 33421, 33422, 34665, 50706, 50707, 50708, 50710,
+    254, 256, 257, 258, 259, 262, 271, 272, 273, 274, 277, 278, 279, 284, 322, 323,
+    324, 325, 330, 530, 33421, 33422, 34665, 50706, 50707, 50708, 50710,
     50714, 50717, 50718, 50719, 50720, 50721, 50722, 50728, 50729,
-    50827, 50829, 50933, 50964, 50965, 50974, 50975,
+    50827, 50829, 50879, 50933, 50964, 50965, 50970, 50974, 50975,
 }
 TYPE_INFO = {
     1: (1, "B"), 2: (1, None), 3: (2, "H"), 4: (4, "I"),
@@ -60,6 +60,7 @@ class DngInfo:
     has_original_raw: bool
     original_raw_name: str
     warnings: tuple[str, ...]
+    colorimetric_reference: int = 0
 
     @property
     def megapixels(self) -> float:
@@ -250,5 +251,5 @@ def inspect_dng(path: str | Path) -> DngInfo:
         stored_width, stored_height, width, height, bits, samples, compression,
         COMPRESSION_NAMES.get(compression, str(compression)), planes,
         bool(matrix), bool(has_neutral or has_xy), wb_ready, original_present,
-        str(tags.get(50827, "")), tuple(warnings),
+        str(tags.get(50827, "")), tuple(warnings), int(_first(main, 50879, 0)),
     )

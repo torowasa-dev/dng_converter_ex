@@ -9,6 +9,10 @@ import time
 PRIORITY_LABELS = {"normal": "通常", "low": "低め", "idle": "最低"}
 
 
+class ProcessControlError(RuntimeError):
+    """A live process could not be monitored or controlled."""
+
+
 class CpuBudget:
     """A single CPU-time budget; idle attempts do not reserve CPU capacity."""
 
@@ -45,7 +49,8 @@ class CpuBudget:
 
 class ProcessControl:
     def __init__(self, pid: int, priority: str, cpu_limit: int, *, api=None, cpus: int | None = None,
-                 budget: CpuBudget | None = None):
+                 budget: CpuBudget | None = None, has_exited=None):
+        self._pid, self._has_exited = pid, has_exited
         self._paused = []
         self.throttled_seconds = 0.0
         self._budget, self._registered = budget, False
@@ -60,7 +65,8 @@ class ProcessControl:
         self.api, self.priority = api, priority
         try:
             self.root = api.Process(pid)
-        except api.NoSuchProcess:
+        except (api.NoSuchProcess, api.AccessDenied) as exc:
+            self._check_process_error(None, exc)
             self.enabled = False
             return
         self.rate = (cpus or api.cpu_count() or 1) * cpu_limit / 100
@@ -69,6 +75,23 @@ class ProcessControl:
         self._balance = 0.0
         self._last_cpu = self._snapshot()[1]
         self._last_wall = time.monotonic()
+
+    def _check_process_error(self, process, exc) -> None:
+        if isinstance(exc, self.api.NoSuchProcess):
+            return
+        # Popen owns the Adobe handle. Its exit observation remains reliable
+        # when querying an already-exited Windows process is access-denied.
+        if (process is None or process.pid == self._pid) and self._has_exited and self._has_exited():
+            return
+        if process is not None:
+            try:
+                if not process.is_running():
+                    return
+            except self.api.NoSuchProcess:
+                return
+            except self.api.AccessDenied:
+                pass
+        raise ProcessControlError(f"CPU・優先度制御エラー: {type(exc).__module__}.{type(exc).__name__}: {exc}") from exc
 
     def _priority(self, process) -> None:
         if self.priority == "normal":
@@ -84,15 +107,16 @@ class ProcessControl:
     def _snapshot(self):
         try:
             discovered = [self.root, *self.root.children(recursive=True)]
-        except self.api.NoSuchProcess:
+        except (self.api.NoSuchProcess, self.api.AccessDenied) as exc:
+            self._check_process_error(self.root, exc)
             discovered = []
         for process in discovered:
             try:
                 key = (process.pid, process.create_time())
                 if key not in self._processes:
                     self._processes[key] = process
-            except self.api.NoSuchProcess:
-                pass
+            except (self.api.NoSuchProcess, self.api.AccessDenied) as exc:
+                self._check_process_error(process, exc)
         active = []
         for key, process in list(self._processes.items()):
             try:
@@ -105,7 +129,8 @@ class ProcessControl:
                 usage = process.cpu_times()
                 self._totals[key] = max(self._totals.get(key, 0), usage.user + usage.system)
                 active.append(process)
-            except self.api.NoSuchProcess:
+            except (self.api.NoSuchProcess, self.api.AccessDenied) as exc:
+                self._check_process_error(process, exc)
                 del self._processes[key]
         return active, sum(self._totals.values())
 
@@ -132,8 +157,8 @@ class ProcessControl:
                 try:
                     process.suspend()
                     self._paused.append(process)
-                except self.api.NoSuchProcess:
-                    pass
+                except (self.api.NoSuchProcess, self.api.AccessDenied) as exc:
+                    self._check_process_error(process, exc)
             if not self._paused:
                 return
             pause_started = time.monotonic()
@@ -153,14 +178,18 @@ class ProcessControl:
         for process in reversed(self._paused):
             try:
                 process.resume()
-            except self.api.NoSuchProcess:
-                pass
+            except (self.api.NoSuchProcess, self.api.AccessDenied) as exc:
+                try:
+                    self._check_process_error(process, exc)
+                except ProcessControlError as failure:
+                    failed.append(process)
+                    error = failure
             except Exception as exc:
                 failed.append(process)
                 error = exc
         self._paused = failed
         if error is not None:
-            raise RuntimeError("変換プロセスの再開に失敗しました。") from error
+            raise ProcessControlError(f"変換プロセスの再開に失敗しました: {type(error).__name__}: {error}") from error
 
     def __enter__(self):
         if self.enabled and self.limited and self._budget is not None:
@@ -175,3 +204,4 @@ class ProcessControl:
             if self._registered:
                 self._budget.release()
                 self._registered = False
+
